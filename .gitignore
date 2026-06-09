@@ -1,0 +1,17 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Donnees IRM
+*.nii
+*.nii.gz
+*.acqp
+data/
+
+# Python - fichiers generes automatiquement
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Variables sensibles (mots de passe, chemins locaux)
+.env
