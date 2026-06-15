@@ -1,0 +1,50 @@
+site_name: Sphene MRI
+site_description: T2 relaxometry analysis pipeline for plant MRI data
+repo_url: https://github.com/e-gernet/sphene-mri
+repo_name: sphene-mri
+
+theme:
+  name: material
+  language: fr
+  palette:
+    - scheme: default
+      primary: teal
+      toggle:
+        icon: material/brightness-7
+        name: Passer en mode sombre
+    - scheme: slate
+      primary: teal
+      toggle:
+        icon: material/brightness-4
+        name: Passer en mode clair
+  features:
+    - navigation.tabs
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [.]
+          options:
+            docstring_style: numpy
+            show_source: true
+            show_root_heading: true
+            merge_init_into_class: true
+            members_order: source
+
+nav:
+  - Accueil: index.md
+  - Installation: installation.md
+  - Tutoriels:
+      - Utilisation de base: tutorials/usage.md
+  - Référence API:
+      - io: api/io.md
+      - model: api/model.md
+      - utils: api/utils.md
+      - mapping: api/mapping.md
+      - display: api/display.md

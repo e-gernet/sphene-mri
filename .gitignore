@@ -15,3 +15,6 @@ __pycache__/
 
 # Variables sensibles (mots de passe, chemins locaux)
 .env
+
+# Vscode environnement
+.vscode/
