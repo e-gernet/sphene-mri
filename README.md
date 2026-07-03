@@ -34,13 +34,13 @@ ou via winget :
 winget install Git.Git
 ```
 
-####Linux
+#### Linux
 ```bash
 sudo apt update
 sudo apt install git
 ```
 
-####macOS
+#### macOS
 ```bash
 brew install git
 ```
@@ -54,7 +54,7 @@ Pixi est compatible Windows / Linux / macOS.
 winget install prefix-dev.pixi
 ```
 
-####Linux / macOS
+#### Linux / macOS
 ```bash
 curl -fsSL https://pixi.sh/install.sh | bash
 ```
