@@ -14,12 +14,55 @@ Pipeline d'analyse de relaxométrie T2 pour des données IRM de plantes
 - Cartographies paramétriques voxel par voxel (T2, I0, fractions, erreurs)
 - Visualisation interactive 2D (matplotlib) et 3D (Plotly)
 
+## Prérequis
+
+Avant d’installer le projet, vous devez avoir :
+
+- Git
+- Ce projet utilise [Pixi](https://pixi.sh/) pour la gestion de l'environnement.
+
 ## Installation
 
-Ce projet utilise [Pixi](https://pixi.sh/) pour la gestion de l'environnement.
+### 1. Installer Git
+
+#### Windows
+Télécharger depuis :
+https://git-scm.com/download/win
+
+ou via winget :
+```bash
+winget install Git.Git
+```
+
+####Linux
+```bash
+sudo apt update
+sudo apt install git
+```
+
+####macOS
+```bash
+brew install git
+```
+
+### 2. Installer Pixi
+
+Pixi est compatible Windows / Linux / macOS.
+
+#### Windows (PowerShell)
+```bash
+winget install prefix-dev.pixi
+```
+
+####Linux / macOS
+```bash
+curl -fsSL https://pixi.sh/install.sh | bash
+```
+
+### 3. Installer Sphene MRI
 
 ```bash
-git clone git@github.com:e-gernet/sphene-mri.git
+git clone https://github.com/e-gernet/sphene-mri.git
 cd sphene-mri
 pixi install
 ```

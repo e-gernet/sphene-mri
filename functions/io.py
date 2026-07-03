@@ -4,7 +4,7 @@ Input/output functions for MRI data loading and user interaction.
 This module handles:
 - NIfTI file loading via nibabel
 - ACQP file parsing to extract echo times
-- GUI dialogs (tkinter) for file selection and manual TE entry
+- GUI dialogs (tkinter) for file selection and manual ET entry
 """
 
 import re

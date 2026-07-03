@@ -2,7 +2,7 @@
 authors = ["Enody Gernet <enody.gernet@inrae.fr>"]
 channels = ["conda-forge"]
 name = "sphene-mri"
-platforms = ["win-64"]
+platforms = ["win-64", "linux-64", "osx-64", "osx-arm64"]
 version = "0.1.0"
 
 [tasks]
@@ -20,3 +20,4 @@ mkdocs = ">=1.6.1,<2"
 mkdocs-material = ">=9.7.6,<10"
 mkdocstrings = ">=1.0.4,<2"
 mkdocstrings-python = ">=2.0.4,<3"
+scikit-image = ">=0.26.0,<0.27"

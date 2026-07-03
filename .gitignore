@@ -6,7 +6,9 @@
 *.nii
 *.nii.gz
 *.acqp
-data/
+data/*
+!data/test/
+!data/test/**
 
 # Python - fichiers generes automatiquement
 __pycache__/
