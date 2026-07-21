@@ -7,7 +7,9 @@ This module handles:
 - GUI dialogs (tkinter) for file selection and manual ET entry
 """
 
+import csv
 import re
+from pathlib import Path
 
 import nibabel as nib
 import numpy as np
@@ -258,3 +260,71 @@ def handle_acqp(data):
 
     root.mainloop()
     return result
+
+
+# ── Export ────────────────────────────────────────────────────────────────────
+
+def export_table(maps_dict, z, filepath, mask=None):
+    """Export several 2-D maps as a single long-format table (one row per voxel).
+
+    Instead of one CSV grid per map, this writes a single "tidy" CSV where
+    each row is one voxel, with one column per computed quantity — the
+    standard shape expected by statistical tools (pandas, R, Excel pivot
+    tables, ...).
+
+    Parameters
+    ----------
+    maps_dict : dict[str, np.ndarray]
+        Mapping from column name to a 2-D array of shape (nx, ny). All
+        arrays must share the same shape.
+    z : int
+        Slice index, written into a ``slice`` column for traceability
+        (useful once several slices get concatenated into one file).
+    filepath : str or os.PathLike
+        Destination path, with or without ``.csv`` extension.
+    mask : np.ndarray of shape (nx, ny), dtype bool, optional
+        Tissue mask (e.g. the Rician mask for this slice). Only voxels
+        where ``mask`` is ``True`` are written — this excludes background
+        (0/NaN) voxels outside the sample (grain), as opposed to writing
+        the full 160x160 grid.
+        If ``None``, a voxel is kept as soon as at least one column has a
+        non-NaN value.
+
+    Returns
+    -------
+    filepath : pathlib.Path
+        Full path of the written CSV file.
+
+    Examples
+    --------
+    >>> maps = {"T2_mono": t2_mono, "T2_mono_offset": t2_mono_off}
+    >>> export_table(maps, z=7, filepath="exports/T2_z7", mask=mask[:, :, 7])
+    """
+    filepath = Path(filepath).with_suffix(".csv")
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    names = list(maps_dict.keys())
+    arrays = [maps_dict[n] for n in names]
+    nx, ny = arrays[0].shape
+
+    n_rows = 0
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(["slice", "x", "y"] + names)
+        for x in range(nx):
+            for y in range(ny):
+                if mask is not None:
+                    keep = bool(mask[x, y])
+                else:
+                    keep = any(not np.isnan(arr[x, y]) for arr in arrays)
+                if not keep:
+                    continue
+                # French Excel convention: comma as decimal separator.
+                row = [z, x, y] + [
+                    f"{arr[x, y]:.6f}".replace(".", ",") for arr in arrays
+                ]
+                writer.writerow(row)
+                n_rows += 1
+
+    print(f"[Export] {n_rows} voxel(s), {len(names)} colonne(s) → {filepath}")
+    return filepath, n_rows
