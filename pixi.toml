@@ -6,6 +6,8 @@ platforms = ["win-64", "linux-64", "osx-64", "osx-arm64"]
 version = "0.1.0"
 
 [tasks]
+sphene = "python main.py"
+filter-compare = "python main.py --compare-filters"
 
 [dependencies]
 python = "3.11.*"
@@ -16,8 +18,31 @@ joblib = ">=1.5.3,<2"
 tqdm = ">=4.68.1,<5"
 nibabel = ">=5.4.2,<6"
 plotly = ">=6.8.0,<7"
+scikit-image = ">=0.26.0,<0.27"
+
+[feature.gpu]
+platforms = ["win-64", "linux-64"]
+
+[feature.gpu.dependencies]
+cupy = ">=13.0,<14"
+
+[feature.gpu.tasks]
+sphene-gpu = "python main.py --device gpu"
+
+[feature.dev.dependencies]
 mkdocs = ">=1.6.1,<2"
 mkdocs-material = ">=9.7.6,<10"
 mkdocstrings = ">=1.0.4,<2"
 mkdocstrings-python = ">=2.0.4,<3"
-scikit-image = ">=0.26.0,<0.27"
+ruff = ">=0.8,<1"
+ipython = ">=8.0,<9"
+
+[feature.dev.tasks]
+lint = "ruff check ."
+format = "ruff format ."
+docs = "mkdocs serve"
+
+[environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+gpu = { features = ["gpu"], solve-group = "default" }
