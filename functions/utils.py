@@ -12,6 +12,7 @@ import contextlib
 import joblib
 import numpy as np
 from scipy import ndimage
+from scipy.signal import savgol_filter
 
 
 # ── joblib / tqdm ─────────────────────────────────────────────────────────────
@@ -231,6 +232,124 @@ def estimate_noise(data, corner_fraction=0.05):
     mean, std = np.mean(corners), np.std(corners)
     print(f"[Noise] Mean: {mean:.4f} | Std: {std:.4f}")
     return mean, std
+
+
+# ── Pre-processing filters ────────────────────────────────────────────────────
+
+def _check_gpu_available():
+    """Check whether a CUDA GPU and ``cupy`` are usable.
+
+    Returns
+    -------
+    available : bool
+        ``True`` if ``cupy`` is installed and at least one CUDA device is
+        detected. ``False`` otherwise (including if ``cupy`` is simply not
+        installed — this is not an error, just "no GPU path available").
+    """
+    try:
+        import cupy as cp
+        cp.cuda.Device(0).compute_capability  # raises if no usable device
+        return True
+    except Exception:
+        return False
+
+
+def filter_data(data, method="none", sigma=1.0, window=5, poly=2, device="cpu"):
+    """Filter the raw 4-D MRI volume before masking and fitting.
+
+    Two independent strategies are available:
+
+    - ``"gaussian_spatial"`` : Gaussian smoothing applied slice-by-slice,
+      independently for each echo. Reduces spatial noise but blurs tissue
+      boundaries. Supports both CPU (scipy) and GPU (cupy) execution.
+    - ``"savgol_temporal"`` : Savitzky-Golay smoothing applied along the
+      echo-time axis, voxel by voxel. Smooths the decay curve without
+      touching spatial resolution. CPU only — no GPU implementation yet.
+
+    Parameters
+    ----------
+    data : np.ndarray of shape (nx, ny, nz, n_te)
+        Raw MRI data.
+    method : {"none", "gaussian_spatial", "savgol_temporal"}, optional
+        Filtering strategy. Default is ``"none"`` (no filtering, returns
+        ``data`` unchanged).
+    sigma : float, optional
+        Standard deviation for the Gaussian kernel (spatial method only).
+        Default is 1.0.
+    window : int, optional
+        Window length for the Savitzky-Golay filter (temporal method only).
+        Must be odd and greater than ``poly``. Default is 5.
+    poly : int, optional
+        Polynomial order for the Savitzky-Golay filter (temporal method
+        only). Default is 2.
+    device : {"cpu", "gpu"}, optional
+        Compute device for ``"gaussian_spatial"``. If ``"gpu"`` is
+        requested but no CUDA device / ``cupy`` install is found, silently
+        falls back to CPU with an explanatory message (never raises).
+        Ignored for ``"savgol_temporal"`` and ``"none"``. Default ``"cpu"``.
+
+    Returns
+    -------
+    filtered : np.ndarray of shape (nx, ny, nz, n_te)
+        Filtered data, same shape and dtype as the input, always a plain
+        numpy array regardless of which device performed the computation.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not one of the supported strategies.
+
+    Examples
+    --------
+    >>> data_f = filter_data(data, method="gaussian_spatial", sigma=1.0, device="gpu")
+    >>> data_f = filter_data(data, method="savgol_temporal", window=5, poly=2)
+    """
+    if method == "none":
+        return data
+
+    if method == "gaussian_spatial":
+        use_gpu = device == "gpu"
+        if use_gpu and not _check_gpu_available():
+            print(
+                "[Filter] --device gpu requested but no usable CUDA device "
+                "(or cupy is not installed) — falling back to CPU."
+            )
+            use_gpu = False
+
+        n_echos = data.shape[3]
+
+        if use_gpu:
+            import cupy as cp
+            from cupyx.scipy import ndimage as cndimage
+            print("[Filter] Running gaussian_spatial on GPU (cupy).")
+            data_gpu = cp.asarray(data)
+            filtered_gpu = cp.empty_like(data_gpu)
+            for t in range(n_echos):
+                filtered_gpu[..., t] = cndimage.gaussian_filter(
+                    data_gpu[..., t], sigma=sigma
+                )
+            return cp.asnumpy(filtered_gpu)
+
+        filtered = np.empty_like(data)
+        for t in range(n_echos):
+            filtered[..., t] = ndimage.gaussian_filter(data[..., t], sigma=sigma)
+        return filtered
+
+    if method == "savgol_temporal":
+        n_echos = data.shape[3]
+        win = min(window, n_echos if n_echos % 2 == 1 else n_echos - 1)
+        if win <= poly:
+            print(
+                f"[Filter] Not enough echoes ({n_echos}) for Savitzky-Golay "
+                f"(window={win}, poly={poly}) — skipping temporal filter."
+            )
+            return data
+        return savgol_filter(data, window_length=win, polyorder=poly, axis=-1)
+
+    raise ValueError(
+        f"Unknown method '{method}'. Choose from "
+        f"['none', 'gaussian_spatial', 'savgol_temporal']."
+    )
 
 
 # ── Masking ───────────────────────────────────────────────────────────────────
