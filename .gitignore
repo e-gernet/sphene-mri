@@ -20,3 +20,6 @@ __pycache__/
 
 # Vscode environnement
 .vscode/
+
+#github pages
+site/
