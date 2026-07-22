@@ -7,16 +7,21 @@ Pipeline d'analyse de relaxométrie T2 pour des données IRM de plantes
 
 - Chargement de fichiers NIfTI et lecture des temps d'écho (fichiers ACQP
   Bruker, saisie manuelle, ou génération synthétique)
+- Filtrage optionnel du signal avant masquage et fit (spatial ou temporel),
+  avec un mode de comparaison objective (R², RMSE) et accélération GPU
+  facultative pour le filtre spatial
 - Génération de masques tissulaires (Rician, Otsu, histogramme)
 - Ajustement de modèles de décroissance T2 : mono-exponentiel, mono-exponentiel
   avec offset, bi-exponentiel, bi-exponentiel avec offset
 - Sélection de modèle par critère d'information d'Akaike (AIC)
 - Cartographies paramétriques voxel par voxel (T2, I0, fractions, erreurs)
+- Export des cartes calculées en tableau CSV (une ligne par voxel), filtré
+  sur le masque tissulaire et auto-vérifié à l'écriture
 - Visualisation interactive 2D (matplotlib) et 3D (Plotly)
 
 ## Prérequis
 
-Avant d’installer le projet, vous devez avoir :
+Avant d'installer le projet, vous devez avoir :
 
 - Git
 - Ce projet utilise [Pixi](https://pixi.sh/) pour la gestion de l'environnement.
@@ -67,10 +72,29 @@ cd sphene-mri
 pixi install
 ```
 
+Environnements optionnels :
+
+```bash
+pixi install -e dev   # lint, formatage, documentation locale
+pixi install -e gpu   # accélération GPU du filtrage (NVIDIA/CUDA uniquement)
+```
+
 ## Utilisation
 
 ```bash
-pixi run python main.py
+pixi run sphene
+```
+
+Avec accélération GPU :
+
+```bash
+pixi run -e gpu sphene-gpu
+```
+
+Comparer les stratégies de filtrage avant de choisir :
+
+```bash
+pixi run filter-compare
 ```
 
 ## Documentation
@@ -82,7 +106,7 @@ référence API) est disponible ici :
 Pour la consulter en local :
 
 ```bash
-pixi run mkdocs serve
+pixi run -e dev docs
 ```
 
 ## Statut du projet

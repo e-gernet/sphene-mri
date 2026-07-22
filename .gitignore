@@ -23,3 +23,6 @@ __pycache__/
 
 #github pages
 site/
+
+# Exports générés par le bouton Export
+exports/
