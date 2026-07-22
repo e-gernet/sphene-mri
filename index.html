@@ -868,31 +868,39 @@ végétaux (graines, algues, plantes) par relaxométrie T2.</p>
 <ul>
 <li>Chargement de fichiers NIfTI et lecture des temps d'écho depuis des fichiers
   ACQP (format Bruker ParaVision)</li>
+<li>Filtrage optionnel du signal avant masquage et fit, spatial (gaussien) ou
+  temporel (Savitzky-Golay le long de l'axe TE), avec un mode comparaison
+  pour évaluer objectivement le gain (R², RMSE)</li>
 <li>Génération de masques tissulaires (seuillage Rician, Otsu, histogramme)</li>
 <li>Ajustement de modèles de décroissance T2 : mono-exponentiel, mono-exponentiel
   avec offset, bi-exponentiel, bi-exponentiel avec offset</li>
 <li>Sélection de modèle par critère d'information d'Akaike (AIC)</li>
 <li>Cartographies paramétriques voxel par voxel (T2, I0, fractions, erreurs)</li>
+<li>Export des cartes calculées en tableau long (CSV, une ligne par voxel),
+  filtré sur le masque tissulaire, avec auto-vérification à l'écriture</li>
 <li>Visualisation interactive 2D (matplotlib) et 3D (Plotly)</li>
+<li>Accélération GPU (cupy) optionnelle pour le filtrage spatial, avec repli
+  automatique sur CPU si aucun GPU CUDA n'est disponible</li>
 </ul>
 <h2 id="demarrage-rapide">Démarrage rapide</h2>
-<pre><code class="language-bash">pixi run python main.py
+<pre><code class="language-bash">pixi run sphene
 </code></pre>
 <p>Voir la page <a href="installation/">Installation</a> pour la mise en place complète
-de l'environnement, et <a href="tutorials/usage/">Utilisation de base</a> pour un
-guide pas à pas.</p>
+de l'environnement (y compris les environnements optionnels <code>dev</code> et <code>gpu</code>),
+et <a href="tutorials/usage/">Utilisation de base</a> pour un guide pas à pas.</p>
 <h2 id="structure-du-projet">Structure du projet</h2>
 <pre><code>sphene-mri/
-├── main.py              # point d'entrée
+├── main.py                # point d'entrée (flags --device, --compare-filters)
 ├── functions/
-│   ├── io.py            # chargement NIfTI / ACQP, dialogues
-│   ├── model.py         # modèles de décroissance T2
-│   ├── utils.py         # métriques, bruit, masques
-│   ├── mapping.py        # calcul voxel-wise parallélisé
-│   └── display.py        # interface interactive
-├── pixi.toml             # dépendances (reproductible)
+│   ├── io.py               # chargement NIfTI / ACQP, dialogues, export CSV
+│   ├── model.py             # modèles de décroissance T2
+│   ├── utils.py              # métriques, bruit, masques, filtrage (CPU/GPU)
+│   ├── filter_compare.py      # comparaison objective des stratégies de filtrage
+│   ├── mapping.py              # calcul voxel-wise parallélisé
+│   └── display.py               # interface interactive
+├── pixi.toml                      # dépendances et environnements (default/dev/gpu)
 ├── pixi.lock
-└── docs/                  # cette documentation
+└── docs/                            # cette documentation
 </code></pre>
 <h2 id="licence-et-contexte">Licence et contexte</h2>
 <p>Projet open science développé dans le cadre d'un CDD INRAE, portant sur

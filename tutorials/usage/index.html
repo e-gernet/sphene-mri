@@ -553,10 +553,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#4-masque-tissulaire" class="md-nav__link">
+  <a href="#4-filtrage-optionnel-du-signal" class="md-nav__link">
     <span class="md-ellipsis">
       
-        4. Masque tissulaire
+        4. Filtrage optionnel du signal
       
     </span>
   </a>
@@ -564,15 +564,26 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#5-interface-interactive" class="md-nav__link">
+  <a href="#5-masque-tissulaire" class="md-nav__link">
     <span class="md-ellipsis">
       
-        5. Interface interactive
+        5. Masque tissulaire
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="5. Interface interactive">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-interface-interactive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Interface interactive
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Interface interactive">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -588,6 +599,17 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-export-des-resultats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Export des résultats
+      
+    </span>
+  </a>
   
 </li>
       
@@ -875,10 +897,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#4-masque-tissulaire" class="md-nav__link">
+  <a href="#4-filtrage-optionnel-du-signal" class="md-nav__link">
     <span class="md-ellipsis">
       
-        4. Masque tissulaire
+        4. Filtrage optionnel du signal
       
     </span>
   </a>
@@ -886,15 +908,26 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#5-interface-interactive" class="md-nav__link">
+  <a href="#5-masque-tissulaire" class="md-nav__link">
     <span class="md-ellipsis">
       
-        5. Interface interactive
+        5. Masque tissulaire
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="5. Interface interactive">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-interface-interactive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Interface interactive
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Interface interactive">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -910,6 +943,17 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-export-des-resultats" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Export des résultats
+      
+    </span>
+  </a>
   
 </li>
       
@@ -948,8 +992,27 @@
 <p>Ce tutoriel décrit le déroulement complet d'une analyse, du chargement des
 données à l'exploration des cartographies T2.</p>
 <h2 id="1-lancer-le-pipeline">1. Lancer le pipeline</h2>
-<pre><code class="language-bash">pixi run python main.py
+<pre><code class="language-bash">pixi run sphene
 </code></pre>
+<p>Options disponibles (<code>python main.py --help</code>) :</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effet</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--device {cpu,gpu}</code></td>
+<td>Device utilisé pour le filtrage spatial. <code>gpu</code> nécessite l'environnement <code>gpu</code> (<code>pixi install -e gpu</code>) ; repli automatique sur CPU sinon, avec message explicite.</td>
+</tr>
+<tr>
+<td><code>--compare-filters</code></td>
+<td>Compare les stratégies de filtrage (<code>none</code>, <code>gaussian_spatial</code>, <code>savgol_temporal</code>) sur la coupe centrale, affiche R²/RMSE moyens, et ne lance pas le visualiseur.</td>
+</tr>
+</tbody>
+</table>
 <h2 id="2-charger-un-fichier-nifti">2. Charger un fichier NIfTI</h2>
 <p>Une fenêtre de sélection de fichier s'ouvre. Choisissez votre fichier
 <code>.nii</code> ou <code>.nii.gz</code> (volume 4D : x, y, z, temps d'écho).</p>
@@ -964,12 +1027,24 @@ données à l'exploration des cartographies T2.</p>
 <li><strong>Enter TE manually</strong> : saisie manuelle des valeurs, séparées par des
   espaces ou virgules.</li>
 </ul>
-<h2 id="4-masque-tissulaire">4. Masque tissulaire</h2>
+<h2 id="4-filtrage-optionnel-du-signal">4. Filtrage optionnel du signal</h2>
+<p>Avant le calcul du masque et l'ajustement des modèles, un filtre peut être
+appliqué au signal brut (voir <a href="../../api/utils/"><code>filter_data</code></a>) :</p>
+<ul>
+<li><code>gaussian_spatial</code> : lissage spatial, par coupe et par écho indépendamment.</li>
+<li><code>savgol_temporal</code> : lissage le long de l'axe des temps d'écho, voxel par
+  voxel.</li>
+</ul>
+<p>Le filtre actif se règle via <code>FILTER_METHOD</code> dans <code>main.py</code> (<code>"none"</code> par
+défaut). Pour comparer objectivement les méthodes avant de choisir, utiliser
+<code>pixi run filter-compare</code> (voir <a href="../../api/utils/"><code>compare_filters</code></a>).</p>
+<h2 id="5-masque-tissulaire">5. Masque tissulaire</h2>
 <p>Un masque binaire est calculé automatiquement avec la méthode <strong>Rician</strong>
 (seuillage basé sur le bruit de fond, recommandé pour les données IRM en
-magnitude). Voir <a href="../../api/utils/"><code>compute_mask</code></a> pour les autres méthodes
-disponibles (<code>otsu</code>, <code>histogram</code>).</p>
-<h2 id="5-interface-interactive">5. Interface interactive</h2>
+magnitude), sur les données déjà filtrées le cas échéant. Voir
+<a href="../../api/utils/"><code>compute_mask</code></a> pour les autres méthodes disponibles
+(<code>otsu</code>, <code>histogram</code>).</p>
+<h2 id="6-interface-interactive">6. Interface interactive</h2>
 <p>La fenêtre principale affiche le volume avec deux curseurs :</p>
 <ul>
 <li><strong>Slice</strong> : navigation dans l'axe z</li>
@@ -1006,11 +1081,15 @@ disponibles (<code>otsu</code>, <code>histogram</code>).</p>
 </tr>
 <tr>
 <td><strong>Noise</strong></td>
-<td>Histogramme du bruit de fond, cartes de l'offset C, masque.</td>
+<td>Histogramme du bruit de fond, cartes de l'offset C (zéros exclus du calcul de moyenne, seuil à 1.0 pour écarter les solutions bornées).</td>
 </tr>
 <tr>
 <td><strong>3D View</strong></td>
 <td>Rendu volumique interactif (ouvre dans le navigateur).</td>
+</tr>
+<tr>
+<td><strong>Export</strong></td>
+<td>Exporte toutes les cartes déjà calculées pour la coupe affichée en un CSV unique, format long (voir ci-dessous).</td>
 </tr>
 <tr>
 <td><strong>Reset</strong></td>
@@ -1021,6 +1100,18 @@ disponibles (<code>otsu</code>, <code>histogram</code>).</p>
 <p>!!! tip "Cache par slice"
     Chaque calcul (Mono Map, Bi Map, etc.) est mis en cache par slice. Changer
     de slice puis revenir ne relance pas le calcul.</p>
+<p>!!! tip "Lecture des coordonnées"
+    Sur le visualiseur principal et les cartes calculées (Mono Map, Bi Map,
+    Error, I0), la barre d'outils matplotlib affiche <code>x=... y=...</code>
+    directement alignés sur l'indexation utilisée dans les CSV exportés —
+    pas besoin d'inverser les coordonnées manuellement.</p>
+<h2 id="7-export-des-resultats">7. Export des résultats</h2>
+<p>Un clic sur <strong>Export</strong> génère <code>exports/T2_slice_z&lt;N&gt;.csv</code> : une ligne par
+voxel du masque tissulaire, une colonne par grandeur calculée (T2, C, R²,
+AIC, ...). Format compatible Excel français : séparateur <code>;</code>, décimales à
+la virgule. Chaque écriture est relue et comparée aux données en mémoire
+avant de confirmer le succès (bouton vert) ou signaler un écart précis
+(bouton rouge, détail en console).</p>
 <h2 id="exemple-danalyse-voxel-par-voxel">Exemple d'analyse voxel par voxel</h2>
 <ol>
 <li>Cliquer sur <strong>Fit</strong> (le bouton devient vert)</li>

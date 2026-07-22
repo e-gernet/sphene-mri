@@ -468,6 +468,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Installer l&#39;environnement">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#environnements-optionnels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Environnements optionnels
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -850,6 +867,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Installer l&#39;environnement">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#environnements-optionnels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Environnements optionnels
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -922,14 +956,44 @@ celui utilisé pour le développement :</p>
 </code></pre>
 <p>Aucune activation manuelle n'est nécessaire — toutes les commandes <code>pixi run</code>
 s'exécutent automatiquement dans cet environnement.</p>
+<h3 id="environnements-optionnels">Environnements optionnels</h3>
+<p>En plus de l'environnement <code>default</code> (strict nécessaire pour faire tourner
+le pipeline), deux environnements optionnels sont disponibles :</p>
+<table>
+<thead>
+<tr>
+<th>Environnement</th>
+<th>Contenu</th>
+<th>Installation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dev</code></td>
+<td>Outils de développement : lint (<code>ruff</code>), formatage, documentation (<code>mkdocs</code>), <code>ipython</code></td>
+<td><code>pixi install -e dev</code></td>
+</tr>
+<tr>
+<td><code>gpu</code></td>
+<td>Accélération GPU du filtrage spatial via <code>cupy</code> (nécessite un GPU NVIDIA/CUDA, Windows ou Linux uniquement)</td>
+<td><code>pixi install -e gpu</code></td>
+</tr>
+</tbody>
+</table>
+<p>Chaque environnement optionnel inclut automatiquement tout le contenu de
+<code>default</code>, en plus de ses propres dépendances — pas besoin de tout
+réinstaller.</p>
 <h2 id="verifier-linstallation">Vérifier l'installation</h2>
 <pre><code class="language-bash">pixi run python -c &quot;import nibabel, numpy, scipy, skimage; print('OK')&quot;
 </code></pre>
 <h2 id="lancer-le-pipeline">Lancer le pipeline</h2>
-<pre><code class="language-bash">pixi run python main.py
+<pre><code class="language-bash">pixi run sphene
+</code></pre>
+<p>Avec accélération GPU pour le filtrage (nécessite <code>pixi install -e gpu</code>) :</p>
+<pre><code class="language-bash">pixi run -e gpu sphene-gpu
 </code></pre>
 <h2 id="lancer-la-documentation-en-local">Lancer la documentation en local</h2>
-<pre><code class="language-bash">pixi run mkdocs serve
+<pre><code class="language-bash">pixi run -e dev docs
 </code></pre>
 <p>La documentation est alors accessible sur <code>http://127.0.0.1:8000</code>.</p>
 
