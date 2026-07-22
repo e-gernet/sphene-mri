@@ -46,3 +46,6 @@ docs = "mkdocs serve"
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 gpu = { features = ["gpu"], solve-group = "default" }
+
+[feature.dev.tasks]
+docs-deploy = "mkdocs gh-deploy"
