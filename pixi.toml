@@ -41,6 +41,7 @@ ipython = ">=8.0,<9"
 lint = "ruff check ."
 format = "ruff format ."
 docs = "mkdocs serve"
+docs-deploy = "mkdocs gh-deploy"
 
 [environments]
 default = { solve-group = "default" }
@@ -48,4 +49,3 @@ dev = { features = ["dev"], solve-group = "default" }
 gpu = { features = ["gpu"], solve-group = "default" }
 
 [feature.dev.tasks]
-docs-deploy = "mkdocs gh-deploy"
