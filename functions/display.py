@@ -38,7 +38,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 from matplotlib.colors import ListedColormap
-from matplotlib.widgets import Button, Slider
+from matplotlib.path import Path as MplPath
+from matplotlib.widgets import Button, LassoSelector, Slider
 from scipy.ndimage import gaussian_filter
 
 from .model import fit_mono, fit_mono_offset, fit_bi, fit_bi_offset
@@ -120,6 +121,9 @@ def display_slice(data, te, mask=None):
     t = 0
     mode   = {"value": None}
     cache  = {}
+    # Separate from `mask`: flagged voxels stay IN the tissue mask (still
+    # fitted/exported) but are tagged, e.g. capillary vs sample.
+    capillary_mask = np.zeros_like(mask, dtype=bool) if mask is not None else None
 
     # ── Main figure ───────────────────────────────────────────────────────────
     fig, ax = plt.subplots()
@@ -149,21 +153,46 @@ def display_slice(data, te, mask=None):
     echo_slider.on_changed(update)
     slice_slider.on_changed(update)
 
-    # ── Buttons ───────────────────────────────────────────────────────────────
-    # 9 buttons on one row: width + gap chosen so they all fit from x=0.02 to x=0.93
-    _btn_w = 0.095
-    _btn_gap = 0.005
-    _btn_x = [0.02 + i * (_btn_w + _btn_gap) for i in range(9)]
+    # ── Selection controls (shape / action / propagation) ───────────────────
+    # Hidden by default, shown only while "Select" mode is active — avoids
+    # cluttering the figure the rest of the time.
+    from matplotlib.widgets import CheckButtons, EllipseSelector, RadioButtons, RectangleSelector
 
-    resetax            = plt.axes([_btn_x[8], 0.05, _btn_w, 0.04])
-    ax_button_fit      = plt.axes([_btn_x[7], 0.05, _btn_w, 0.04])
-    ax_button_bi       = plt.axes([_btn_x[6], 0.05, _btn_w, 0.04])
-    ax_button_mono     = plt.axes([_btn_x[5], 0.05, _btn_w, 0.04])
-    ax_button_utils    = plt.axes([_btn_x[4], 0.05, _btn_w, 0.04])
-    ax_button_error    = plt.axes([_btn_x[3], 0.05, _btn_w, 0.04])
-    ax_button_noise    = plt.axes([_btn_x[2], 0.05, _btn_w, 0.04])
-    ax_button_3d       = plt.axes([_btn_x[1], 0.05, _btn_w, 0.04])
-    ax_button_export   = plt.axes([_btn_x[0], 0.05, _btn_w, 0.04])
+    ax_shape = fig.add_axes([0.01, 0.80, 0.16, 0.13])
+    ax_shape.set_title("Shape", fontsize=8)
+    radio_shape = RadioButtons(ax_shape, ("Lasso", "Box", "Circle"))
+    for lbl in radio_shape.labels:
+        lbl.set_fontsize(7)
+
+    ax_action = fig.add_axes([0.01, 0.65, 0.16, 0.11])
+    ax_action.set_title("Action", fontsize=8)
+    radio_action = RadioButtons(ax_action, ("Exclude", "Flag capillary"))
+    for lbl in radio_action.labels:
+        lbl.set_fontsize(7)
+
+    ax_propagate = fig.add_axes([0.01, 0.58, 0.16, 0.05])
+    check_propagate = CheckButtons(ax_propagate, ["All slices"], [False])
+    check_propagate.labels[0].set_fontsize(7)
+
+    for a in (ax_shape, ax_action, ax_propagate):
+        a.set_visible(False)
+
+    # ── Buttons ───────────────────────────────────────────────────────────────
+    # 10 buttons on one row: width + gap chosen so they all fit from x=0.05 to x=0.93
+    _btn_w = 0.086
+    _btn_gap = 0.004
+    _btn_x = [0.05 + i * (_btn_w + _btn_gap) for i in range(10)]
+
+    resetax            = plt.axes([_btn_x[9], 0.05, _btn_w, 0.04])
+    ax_button_fit      = plt.axes([_btn_x[8], 0.05, _btn_w, 0.04])
+    ax_button_bi       = plt.axes([_btn_x[7], 0.05, _btn_w, 0.04])
+    ax_button_mono     = plt.axes([_btn_x[6], 0.05, _btn_w, 0.04])
+    ax_button_utils    = plt.axes([_btn_x[5], 0.05, _btn_w, 0.04])
+    ax_button_error    = plt.axes([_btn_x[4], 0.05, _btn_w, 0.04])
+    ax_button_noise    = plt.axes([_btn_x[3], 0.05, _btn_w, 0.04])
+    ax_button_3d       = plt.axes([_btn_x[2], 0.05, _btn_w, 0.04])
+    ax_button_export   = plt.axes([_btn_x[1], 0.05, _btn_w, 0.04])
+    ax_button_select   = plt.axes([_btn_x[0], 0.05, _btn_w, 0.04])
 
     button_reset        = Button(resetax,         "Reset")
     button_fit          = Button(ax_button_fit,   "Fit")
@@ -174,11 +203,12 @@ def display_slice(data, te, mask=None):
     button_noise        = Button(ax_button_noise, "Noise")
     button_3d           = Button(ax_button_3d,    "3D View")
     button_export       = Button(ax_button_export, "Export")
+    button_select       = Button(ax_button_select, "Select")
 
     _all_buttons = [
         button_fit, button_mono_mapping, button_bi_mapping,
         button_utils, button_error, button_noise, button_3d,
-        button_export, button_reset,
+        button_export, button_select, button_reset,
     ]
     for b in _all_buttons:
         b.label.set_fontsize(7)
@@ -200,12 +230,103 @@ def display_slice(data, te, mask=None):
         nx, ny = mask.shape[0], mask.shape[1]
         return [(x, y) for x in range(nx) for y in range(ny) if mask[x, y, z]]
 
+    # ── Selection (lasso / box / circle → exclude or flag) ──────────────────
+
+    _selector = {"obj": None}
+
+    def _grid_points(nx, ny):
+        """(col, row) points matching the plot-coordinate convention used by
+        matplotlib selectors, reshaped later to the (x, y) = (row, col)
+        array convention used everywhere else (mask[x, y, z])."""
+        rows, cols = np.mgrid[0:nx, 0:ny]
+        return np.column_stack((cols.ravel(), rows.ravel())), (nx, ny)
+
+    def _apply_selection(inside):
+        """Apply the current action (exclude/flag) over `inside` (nx, ny bool
+        mask, array convention), on the current slice or all slices."""
+        action = radio_action.value_selected
+        propagate = check_propagate.get_status()[0]
+        z_list = range(mask.shape[2]) if propagate else [int(slice_slider.val)]
+
+        n_total = 0
+        for z in z_list:
+            if action == "Exclude":
+                n_total += int(np.sum(inside & mask[:, :, z]))
+                mask[:, :, z] &= ~inside
+                # Stale cache for this slice would silently mix old/new masks.
+                for key in [k for k in cache if k[1] == z]:
+                    del cache[key]
+            else:  # "Flag capillary"
+                n_total += int(np.sum(inside & ~capillary_mask[:, :, z]))
+                capillary_mask[:, :, z] |= inside
+
+        scope = "all slices" if propagate else f"slice z={int(slice_slider.val)}"
+        verb = "excluded from the mask" if action == "Exclude" else "flagged as capillary"
+        print(f"[Select] {n_total} voxel(s) {verb} ({scope}).")
+        if action == "Exclude":
+            print("         Cached results cleared where affected — recompute maps to see the effect.")
+
+        mode["value"] = None
+        _selector["obj"] = None
+        _reset_buttons()
+        fig.canvas.draw_idle()
+
+    def _on_lasso_select(verts):
+        points, (nx, ny) = _grid_points(mask.shape[0], mask.shape[1])
+        inside = MplPath(verts).contains_points(points).reshape(nx, ny)
+        _apply_selection(inside)
+
+    def _on_box_select(eclick, erelease):
+        nx, ny = mask.shape[0], mask.shape[1]
+        x0, x1 = sorted([eclick.xdata, erelease.xdata])
+        y0, y1 = sorted([eclick.ydata, erelease.ydata])
+        rows, cols = np.mgrid[0:nx, 0:ny]
+        inside = (cols >= x0) & (cols <= x1) & (rows >= y0) & (rows <= y1)
+        _apply_selection(inside)
+
+    def _on_circle_select(eclick, erelease):
+        nx, ny = mask.shape[0], mask.shape[1]
+        cx, cy = eclick.xdata, eclick.ydata
+        rx = abs(erelease.xdata - eclick.xdata)
+        ry = abs(erelease.ydata - eclick.ydata)
+        rows, cols = np.mgrid[0:nx, 0:ny]
+        inside = ((cols - cx) / max(rx, 1e-9)) ** 2 + ((rows - cy) / max(ry, 1e-9)) ** 2 <= 1
+        _apply_selection(inside)
+
+    def _activate_selector():
+        """(Re)create the matplotlib selector matching the chosen shape."""
+        if _selector["obj"] is not None:
+            _selector["obj"].disconnect_events()
+            _selector["obj"] = None
+        shape = radio_shape.value_selected
+        if shape == "Lasso":
+            _selector["obj"] = LassoSelector(ax, onselect=_on_lasso_select, useblit=True)
+        elif shape == "Box":
+            _selector["obj"] = RectangleSelector(
+                ax, onselect=_on_box_select, useblit=True, button=[1], interactive=False,
+            )
+        else:  # "Circle"
+            _selector["obj"] = EllipseSelector(
+                ax, onselect=_on_circle_select, useblit=True, button=[1], interactive=False,
+            )
+
+    def _on_shape_change(label):
+        if mode["value"] == "select":
+            _activate_selector()
+
+    radio_shape.on_clicked(_on_shape_change)
+
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(event):
         slice_slider.reset()
         echo_slider.reset()
         mode["value"] = None
+        if _selector["obj"] is not None:
+            _selector["obj"].disconnect_events()
+            _selector["obj"] = None
+        for a in (ax_shape, ax_action, ax_propagate):
+            a.set_visible(False)
         _reset_buttons()
         fig.canvas.draw_idle()
 
@@ -228,6 +349,26 @@ def display_slice(data, te, mask=None):
                 else:
                     mode["value"] = "fit"
                     _set_button(button_fit, "#7bff23")
+                fig.canvas.draw_idle()
+                return
+
+            # ── Select (toggle lasso/box/circle exclude or flag) ────────────────
+            if button is button_select:
+                if mode["value"] == "select":
+                    mode["value"] = None
+                    if _selector["obj"] is not None:
+                        _selector["obj"].disconnect_events()
+                        _selector["obj"] = None
+                    for a in (ax_shape, ax_action, ax_propagate):
+                        a.set_visible(False)
+                else:
+                    mode["value"] = "select"
+                    _set_button(button_select, "#7bff23")
+                    for a in (ax_shape, ax_action, ax_propagate):
+                        a.set_visible(True)
+                    _activate_selector()
+                    print("[Select] Draw on the image with the chosen shape. "
+                          "Pick action/shape/propagation on the left before drawing.")
                 fig.canvas.draw_idle()
                 return
 
@@ -766,6 +907,12 @@ def display_slice(data, te, mask=None):
                         if idx in names and isinstance(arr, np.ndarray) and arr.ndim == 2:
                             maps_dict[names[idx]] = arr
 
+                if maps_dict and capillary_mask is not None:
+                    # 1 = voxel flagged as capillary via the Select tool,
+                    # 0 = sample tissue. Lets downstream analysis filter
+                    # capillary vs. sample rows without losing either.
+                    maps_dict["is_capillary"] = capillary_mask[:, :, z].astype(float)
+
                 if not maps_dict:
                     print(
                         "[Export] Rien à exporter — calcule d'abord une carte "
@@ -826,6 +973,7 @@ def display_slice(data, te, mask=None):
     button_error.on_clicked(make_callback(button_error))
     button_3d.on_clicked(make_callback(button_3d))
     button_export.on_clicked(make_callback(button_export))
+    button_select.on_clicked(make_callback(button_select))
 
     # ── Voxel click — per-voxel fit plot ─────────────────────────────────────
 
@@ -834,6 +982,7 @@ def display_slice(data, te, mask=None):
         ui_axes = [
             button_fit.ax, button_mono_mapping.ax, button_bi_mapping.ax,
             button_utils.ax, button_noise.ax, button_reset.ax,
+            button_select.ax, ax_shape, ax_action, ax_propagate,
             axecho, axslice,
         ]
         if event.inaxes in ui_axes:

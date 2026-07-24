@@ -227,11 +227,97 @@ def estimate_noise(data, corner_fraction=0.05):
     --------
     >>> mean, std = estimate_noise(data)
     >>> print(f"SNR estimate: {signal_peak / std:.1f}")
+
+    See Also
+    --------
+    estimate_noise_auto : Corner-free alternative using automatic
+        foreground/background segmentation (recommended — corners can be
+        biased by field-of-view edge artefacts).
     """
     corners = _extract_corners(data, corner_fraction)
     mean, std = np.mean(corners), np.std(corners)
     print(f"[Noise] Mean: {mean:.4f} | Std: {std:.4f}")
     return mean, std
+
+
+def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0):
+    """Estimate background noise mean/std without relying on corner regions.
+
+    Segments background vs. sample automatically with Otsu's threshold on
+    the maximum-intensity projection, then refines the background
+    statistics with iterative sigma-clipping - a standard background
+    estimation technique (widely used in astronomical image reduction)
+    that requires no geometry-specific tuning.
+
+    Why sigma-clipping rather than a fixed dilation margin: a raw Otsu
+    split still contains voxels just below threshold, at the sample's
+    edge, that are brighter than true background (Gibbs ringing,
+    partial-volume, susceptibility halo). Excluding them by dilating the
+    foreground by a fixed number of voxels works, but that number is a
+    magic constant tied to the halo width of *this* sample at *this*
+    resolution - it has no reason to transfer to a different sample
+    shape, size, or acquisition. Sigma-clipping instead treats the halo
+    as what it statistically is: an outlier population relative to the
+    bulk of the background. It is rejected automatically regardless of
+    its width or the sample's geometry, with no free parameter to
+    re-tune per dataset.
+
+    Chosen over a Gaussian-mixture approach for determinism: Otsu has no
+    random initialisation, so the initial split is exactly reproducible.
+
+    Parameters
+    ----------
+    data : np.ndarray of shape (nx, ny, nz) or (nx, ny, nz, n_te)
+        Raw MRI data.
+    n_iter : int, optional
+        Maximum number of sigma-clipping iterations. The loop stops early
+        as soon as an iteration removes no further voxels (convergence).
+        Default is 10.
+    sigma_clip : float, optional
+        Voxels beyond ``sigma_clip`` standard deviations from the current
+        background mean are rejected at each iteration. Default is 3.0.
+
+    Returns
+    -------
+    mean : float
+        Mean intensity over the clipped background voxels.
+    std : float
+        Standard deviation over the clipped background voxels.
+    background_mask : np.ndarray of shape (nx, ny, nz), dtype bool
+        Voxels classified as background *before* clipping (the Otsu
+        split), returned so it can be reused (e.g. plotted) without
+        re-running Otsu. Note this mask does not reflect the clipping
+        step, which only affects the returned statistics.
+
+    Examples
+    --------
+    >>> mean, std, bg = estimate_noise_auto(data)
+    >>> print(f"[Noise] auto mean={mean:.1f} std={std:.1f}")
+    """
+    from skimage.filters import threshold_otsu
+
+    vol = np.max(data, axis=-1) if data.ndim == 4 else data
+    threshold = threshold_otsu(vol)
+    background_mask = vol <= threshold
+
+    bg_values = vol[background_mask]
+    bg_values = bg_values[bg_values > 0]  # drop true zero-padding voxels
+
+    clipped = bg_values
+    for i in range(n_iter):
+        mean, std = np.mean(clipped), np.std(clipped)
+        kept = clipped[np.abs(clipped - mean) < sigma_clip * std]
+        if kept.size == clipped.size:
+            break
+        clipped = kept
+
+    mean, std = float(np.mean(clipped)), float(np.std(clipped))
+    print(
+        f"[Noise] (auto, Otsu + {i + 1}-pass sigma-clip) Mean: {mean:.4f} | "
+        f"Std: {std:.4f} | n={clipped.size}/{bg_values.size} background "
+        f"voxels kept"
+    )
+    return mean, std, background_mask
 
 
 # ── Pre-processing filters ────────────────────────────────────────────────────
@@ -430,10 +516,10 @@ def mask_otsu(data, use_morpho=False):
     return mask
 
 
-def mask_rician(data, corner_fraction=0.05, k=4.0, use_morpho=False):
+def mask_rician(data, background="auto", corner_fraction=0.05, k=4.0, use_morpho=False):
     """Generate a binary mask using a Rician noise threshold.
 
-    Estimates the Rician noise parameter σ from background corners, then
+    Estimates the Rician noise parameter σ from the background, then
     thresholds at k·σ_rician. This approach is better suited to magnitude
     MRI data than Gaussian-based methods.
 
@@ -446,8 +532,19 @@ def mask_rician(data, corner_fraction=0.05, k=4.0, use_morpho=False):
     ----------
     data : np.ndarray of shape (nx, ny, nz) or (nx, ny, nz, n_te)
         Raw MRI data.
+    background : {"auto", "corners"}, optional
+        How the background used to estimate σ_rician is defined.
+
+        - ``"auto"`` (default, recommended) : automatic Otsu segmentation
+          over the full volume (see :func:`estimate_noise_auto`). Uses far
+          more voxels than the corners and is not biased by field-of-view
+          edge artefacts.
+        - ``"corners"`` : legacy behaviour, background sampled from the 8
+          volume corners only. Kept for backward compatibility and for
+          side-by-side comparison against ``"auto"``.
     corner_fraction : float, optional
-        Fraction of each axis used to define background corners. Default 0.05.
+        Fraction of each axis used to define background corners. Only used
+        when ``background="corners"``. Default 0.05.
     k : float, optional
         Threshold multiplier applied to σ_rician. Default is 4.0.
     use_morpho : bool, optional
@@ -458,10 +555,27 @@ def mask_rician(data, corner_fraction=0.05, k=4.0, use_morpho=False):
     -------
     mask : np.ndarray of shape (nx, ny, nz), dtype bool
         Binary mask where ``True`` indicates tissue.
+
+    Examples
+    --------
+    >>> mask = mask_rician(data)                          # Otsu background
+    >>> mask_legacy = mask_rician(data, background="corners")  # for comparison
     """
     vol = np.max(data, axis=-1) if data.ndim == 4 else data
-    corners = _extract_corners(vol if vol.ndim == 3 else data, corner_fraction)
-    sigma_rician = np.mean(corners) / np.sqrt(np.pi / 2)
+
+    if background == "auto":
+        _, _, bg_mask = estimate_noise_auto(vol)
+        bg_values = vol[bg_mask]
+        bg_values = bg_values[bg_values > 0]
+        sigma_rician = np.mean(bg_values) / np.sqrt(np.pi / 2)
+    elif background == "corners":
+        corners = _extract_corners(vol if vol.ndim == 3 else data, corner_fraction)
+        sigma_rician = np.mean(corners) / np.sqrt(np.pi / 2)
+    else:
+        raise ValueError(
+            f"Unknown background '{background}'. Choose from ['auto', 'corners']."
+        )
+
     mask = vol > k * sigma_rician
     if use_morpho:
         mask = _apply_morphology(mask)
