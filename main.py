@@ -23,11 +23,15 @@ import argparse
 
 import numpy as np
 
-from functions.io import (
-    choose_nifti, load_nifti,
-    handle_acqp, choose_acqp, load_acqp, enter_te,
-)
 from functions.display import display_slice
+from functions.io import (
+    choose_acqp,
+    choose_nifti,
+    enter_te,
+    handle_acqp,
+    load_acqp,
+    load_nifti,
+)
 from functions.utils import compute_mask, filter_data
 
 # Pre-processing filter applied before masking and fitting.
@@ -55,6 +59,26 @@ def main():
     # 1. Load NIfTI
     nifti_file = choose_nifti()
     data, img  = load_nifti(nifti_file)
+
+    # Voxel size in mm, from the NIfTI header — previously loaded and
+    # immediately discarded, meaning nothing downstream (maps, CSV export,
+    # popups) had any notion of real-world distance, only raw voxel
+    # indices. Kept here and threaded through to the viewer/export so a
+    # capillary width or sillon size can eventually be reported in mm
+    # instead of voxels.
+    voxel_dims = img.header.get_zooms()[:3]
+    print(
+        f"[Geometry] Voxel size: {voxel_dims[0]:.3f} x {voxel_dims[1]:.3f} "
+        f"x {voxel_dims[2]:.3f} mm"
+    )
+    if tuple(voxel_dims) == (1.0, 1.0, 1.0):
+        print(
+            "[Geometry] ⚠️  x/y/z = (1.0, 1.0, 1.0) mm. This can be a real "
+            "isotropic 1mm resolution, or nibabel's silent default when the "
+            "header has no usable pixdim. Double-check against the "
+            "acquisition source (ParaVision, etc.) before trusting x_mm / "
+            "y_mm / z_mm in the export."
+        )
 
     # 2. Echo times
     te_choice = handle_acqp(data)
@@ -89,7 +113,7 @@ def main():
     mask = compute_mask(data, method="rician")
 
     # 6. Interactive viewer
-    display_slice(data, te_values, mask=mask)
+    display_slice(data, te_values, mask=mask, voxel_dims=voxel_dims)
 
 
 if __name__ == "__main__":
