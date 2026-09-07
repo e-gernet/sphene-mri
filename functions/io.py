@@ -9,15 +9,14 @@ This module handles:
 
 import csv
 import re
-from pathlib import Path
-
-import nibabel as nib
-import numpy as np
 import tkinter as tk
+from pathlib import Path
 from tkinter import Label, Text
 from tkinter.filedialog import askopenfilename
 from tkinter.ttk import Button
 
+import nibabel as nib
+import numpy as np
 
 # ── NIfTI ─────────────────────────────────────────────────────────────────────
 
@@ -51,6 +50,9 @@ def load_nifti(filepath):
         img = nib.load(filepath)
         data = img.get_fdata()
     except Exception:
+        # Broad on purpose: any failure reading/parsing the file (missing,
+        # corrupt, wrong format...) should surface the same clear message
+        # and stop, rather than a raw traceback.
         print("Aucune image chargée, fin de l'opération.")
         raise SystemExit(1)
     return data, img
@@ -138,6 +140,8 @@ def load_acqp(filepath):
             f"{te_values[0]:.1f} – {te_values[-1]:.1f} ms"
         )
     except Exception:
+        # Broad on purpose: regex mismatch, missing field, malformed
+        # numbers... all mean "not a usable ACQP file", same message.
         print("Aucun fichier ACQP valide fourni.")
         raise SystemExit(1)
     return te_values
@@ -181,6 +185,9 @@ def enter_te(data):
                 )
                 root.destroy()
             except Exception:
+                # Broad on purpose: any non-numeric input (typo, stray
+                # letter, empty field after split...) is just invalid
+                # user entry, not a bug to diagnose.
                 print("[TE] Invalid input — please enter numeric values.")
 
     root = tk.Tk()

@@ -22,7 +22,6 @@ robustness.
 import numpy as np
 from scipy.optimize import curve_fit
 
-
 # ── Analytical models ─────────────────────────────────────────────────────────
 
 def _mono(t, I0, T2):
@@ -124,6 +123,15 @@ def fit_mono(te, signal):
         )
         return {"I0": popt[0], "T2": popt[1]}, _mono(te, *popt), pcov
     except Exception:
+        # Deliberately broad: scipy's curve_fit can raise several
+        # different exception types on failure (RuntimeError on no
+        # convergence, ValueError on invalid p0/bounds, numpy's
+        # LinAlgError from the internal SVD, ...). Every caller in this
+        # codebase treats "fit failed, for any reason" identically —
+        # a None result, never a crash — so narrowing this would only
+        # reintroduce crashes on legitimate edge cases without
+        # changing behaviour for genuine bugs (those still show up as
+        # every voxel failing, not a silent single miss).
         return None, None, None
 
 
@@ -177,6 +185,15 @@ def fit_mono_offset(te, signal):
         params = {"I0": popt[0], "T2": popt[1], "C": popt[2]}
         return params, _mono_offset(te, *popt), pcov
     except Exception:
+        # Deliberately broad: scipy's curve_fit can raise several
+        # different exception types on failure (RuntimeError on no
+        # convergence, ValueError on invalid p0/bounds, numpy's
+        # LinAlgError from the internal SVD, ...). Every caller in this
+        # codebase treats "fit failed, for any reason" identically —
+        # a None result, never a crash — so narrowing this would only
+        # reintroduce crashes on legitimate edge cases without
+        # changing behaviour for genuine bugs (those still show up as
+        # every voxel failing, not a silent single miss).
         return None, None, None
 
 
@@ -260,6 +277,15 @@ def fit_bi(te, signal):
         params = {"I0": popt[0], "f": popt[1], "T2c": popt[2], "T2l": popt[3]}
         return params, _bi(te, *popt), pcov
     except Exception:
+        # Deliberately broad: scipy's curve_fit can raise several
+        # different exception types on failure (RuntimeError on no
+        # convergence, ValueError on invalid p0/bounds, numpy's
+        # LinAlgError from the internal SVD, ...). Every caller in this
+        # codebase treats "fit failed, for any reason" identically —
+        # a None result, never a crash — so narrowing this would only
+        # reintroduce crashes on legitimate edge cases without
+        # changing behaviour for genuine bugs (those still show up as
+        # every voxel failing, not a silent single miss).
         return None, None, None
 
 
@@ -338,4 +364,13 @@ def fit_bi_offset(te, signal):
         }
         return params, _bi_offset(te, *popt), pcov
     except Exception:
+        # Deliberately broad: scipy's curve_fit can raise several
+        # different exception types on failure (RuntimeError on no
+        # convergence, ValueError on invalid p0/bounds, numpy's
+        # LinAlgError from the internal SVD, ...). Every caller in this
+        # codebase treats "fit failed, for any reason" identically —
+        # a None result, never a crash — so narrowing this would only
+        # reintroduce crashes on legitimate edge cases without
+        # changing behaviour for genuine bugs (those still show up as
+        # every voxel failing, not a silent single miss).
         return None, None, None
