@@ -11,25 +11,35 @@ All ``_fit_voxel_*`` functions share the same signature expected by
 the voxel coordinates ``(x, y)``.
 """
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 from joblib import Parallel, delayed
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
 from .model import (
-    fit_mono, fit_mono_offset, fit_bi, fit_bi_offset, _estimate_p0,
+    _estimate_p0,
+    fit_bi,
+    fit_bi_offset,
+    fit_mono,
+    fit_mono_offset,
 )
 from .utils import compute_aic, compute_r2, compute_rmse, tqdm_joblib
-
 
 # ── Histogram utility ─────────────────────────────────────────────────────────
 
 def plot_histogram(data, ax=None, bins=100):
-    """Plot the intensity histogram of background corner voxels.
+    """Plot the intensity histogram of the background used for noise stats.
 
-    Extracts voxels from the 8 corners of the volume (assumed to contain
-    only background noise) and displays their intensity distribution.
+    Draws the exact background population produced by
+    :func:`functions.utils.estimate_noise_auto` (Otsu segmentation +
+    iterative sigma-clipping) — the same method that drives
+    ``mask_rician``'s tissue mask. This used to plot corner voxels
+    instead, from a separate, older estimation method; that meant the
+    histogram shown here and the tissue mask shown beside it (e.g. in the
+    "Noise" popup) were computed two different ways and could visually
+    disagree even when both were "correct" on their own terms. They now
+    share the same background population.
 
     Parameters
     ----------
@@ -46,25 +56,18 @@ def plot_histogram(data, ax=None, bins=100):
     >>> plot_histogram(data)                     # standalone figure
     >>> plot_histogram(data, ax=axes[0, 0])      # embed in existing layout
     """
+    from .utils import estimate_noise_auto
+
     vol = np.max(data, axis=-1) if data.ndim == 4 else data
-    nx, ny, nz = vol.shape
-    cx, cy, cz = max(1, nx // 20), max(1, ny // 20), max(1, nz // 20)
-    corners = np.concatenate([
-        vol[:cx,  :cy,  :cz ].flatten(), vol[-cx:, :cy,  :cz ].flatten(),
-        vol[:cx,  -cy:, :cz ].flatten(), vol[-cx:, -cy:, :cz ].flatten(),
-        vol[:cx,  :cy,  -cz:].flatten(), vol[-cx:, :cy,  -cz:].flatten(),
-        vol[:cx,  -cy:, -cz:].flatten(), vol[-cx:, -cy:, -cz:].flatten(),
-    ])
-    corners = corners[corners > 0]
-    mu = np.mean(corners)
+    mean, _std, _background_mask, clipped_values = estimate_noise_auto(vol)
 
     standalone = ax is None
     if standalone:
-        fig, ax = plt.subplots()
+        _fig, ax = plt.subplots()
 
-    ax.hist(corners, bins=bins, density=True, color="steelblue")
-    ax.axvline(mu, linestyle="--", color="cyan", label=f"µ={mu:.1f}")
-    ax.set_title("Background noise histogram")
+    ax.hist(clipped_values, bins=bins, density=True, color="steelblue")
+    ax.axvline(mean, linestyle="--", color="cyan", label=f"µ={mean:.1f}")
+    ax.set_title("Background noise histogram (auto, Otsu + sigma-clip)")
     ax.set_xlabel("Intensity")
     ax.set_ylabel("Density")
     ax.legend()
@@ -320,10 +323,10 @@ def _fit_voxel_error(x, y, signal, te):
     fitted_map : dict
         Fitted signals for all four models, keyed by model name.
     """
-    p_mono,  f_mono,  _ = fit_mono(te, signal)
-    p_off,   f_off,   _ = fit_mono_offset(te, signal)
-    p_bi,    f_bi_fit, _ = fit_bi(te, signal)
-    p_bioff, f_bioff, _ = fit_bi_offset(te, signal)
+    _p_mono,  f_mono,  _ = fit_mono(te, signal)
+    _p_off,   f_off,   _ = fit_mono_offset(te, signal)
+    _p_bi,    f_bi_fit, _ = fit_bi(te, signal)
+    _p_bioff, f_bioff, _ = fit_bi_offset(te, signal)
 
     aic_dict = {
         "mono":        compute_aic(signal, f_mono,   2),
@@ -417,14 +420,22 @@ def _fit_voxel_mono_cfix(x, y, signal, te, c_fixed):
         )
         return x, y, popt[1]
     except Exception:
+        # Same rationale as model.py: curve_fit failures come in several
+        # exception types; every caller treats "failed" uniformly (NaN
+        # here instead of None, since this feeds a numeric map directly).
         return x, y, np.nan
 
 
 def _fit_global(x, y, signal, te, global_best, k):
     """Fit a single voxel with the globally selected best model.
 
-    Used in a second parallel pass (after model selection) to compute
-    R²/RMSE maps using a single model applied uniformly across the slice.
+    .. deprecated::
+        No longer called anywhere in the codebase — the global-model
+        maps (``i0_global``, ``r2_glob_map``, ``rmse_glob_map`` in
+        ``display.py``) are now built by reusing fitted curves already
+        computed in a first pass (``i0_per_model_map``, ``all_fitted``),
+        rather than re-fitting every voxel a second time. Kept here for
+        reference/history; safe to delete once confirmed unneeded.
 
     Parameters
     ----------
