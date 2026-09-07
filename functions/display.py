@@ -42,15 +42,19 @@ from matplotlib.path import Path as MplPath
 from matplotlib.widgets import Button, LassoSelector, Slider
 from scipy.ndimage import gaussian_filter
 
-from .model import fit_mono, fit_mono_offset, fit_bi, fit_bi_offset
-from .utils import compute_aic, compute_r2, compute_rmse, estimate_noise
 from .io import export_table
 from .mapping import (
+    _fit_voxel_bi,
+    _fit_voxel_error,
+    _fit_voxel_mono,
+    _fit_voxel_mono_cfix,
+    _fit_voxel_noise,
+    _fit_voxel_utils,
+    plot_histogram,
     run_parallel,
-    _fit_voxel_mono, _fit_voxel_bi, _fit_voxel_utils,
-    _fit_voxel_noise, _fit_voxel_mono_cfix, _fit_global,
-    _fit_voxel_error, plot_histogram,
 )
+from .model import fit_bi, fit_bi_offset, fit_mono, fit_mono_offset
+from .utils import compute_aic, compute_r2, compute_rmse
 
 # Discrete colour palette for AIC model-selection maps (4 models)
 _AIC_COLORS = ["#4C72B0", "#55A868", "#C44E52", "#8172B2"]
@@ -92,7 +96,7 @@ def _use_array_coords(ax, arr):
     ax.format_coord = format_coord
 
 
-def display_slice(data, te, mask=None):
+def display_slice(data, te, mask=None, voxel_dims=None):
     """Launch the interactive T2 relaxometry viewer.
 
     Opens a matplotlib figure showing the MRI volume with slice and echo
@@ -107,6 +111,12 @@ def display_slice(data, te, mask=None):
         Echo times in milliseconds, in acquisition order.
     mask : np.ndarray of shape (nx, ny, nz), dtype bool, optional
         Binary tissue mask. If ``None``, all voxels are processed (slow).
+    voxel_dims : tuple of 3 floats, optional
+        Real-world voxel size ``(dx, dy, dz)`` in mm, e.g. from
+        ``img.header.get_zooms()[:3]``. If provided, the CSV export adds
+        ``x_mm``/``y_mm``/``z_mm`` columns alongside the raw voxel-index
+        ``x``/``y``/``slice`` columns. If ``None``, export stays
+        index-only (previous behaviour).
 
     Notes
     -----
@@ -139,7 +149,7 @@ def display_slice(data, te, mask=None):
         valstep=1, valmin=0, valmax=data.shape[3] - 1, valinit=t,
     )
 
-    axslice = fig.add_axes([0.1, 0.25, 0.0225, 0.63])
+    axslice = fig.add_axes([0.155, 0.25, 0.0225, 0.63])
     slice_slider = Slider(
         ax=axslice, label="Slice",
         valstep=1, valmin=0, valmax=data.shape[2] - 1, valinit=z,
@@ -148,34 +158,91 @@ def display_slice(data, te, mask=None):
 
     def update(val):
         img.set_data(data[:, :, slice_slider.val, echo_slider.val])
+        _draw_mask_overlay()
         fig.canvas.draw_idle()
 
     echo_slider.on_changed(update)
     slice_slider.on_changed(update)
 
+    # ── Mask overlay (always available, independent of Select mode) ────────
+    # Lets you see what the mask actually covers before drawing a selection
+    # — otherwise it's easy to draw over background/noise voxels that the
+    # fit silently ignores (mask is applied on top of every selection).
+    from matplotlib.widgets import CheckButtons as _CheckButtonsMaskOverlay
+
+    ax_mask_overlay = fig.add_axes([0.01, 0.945, 0.13, 0.045])
+    check_mask_overlay = _CheckButtonsMaskOverlay(ax_mask_overlay, ["Show mask"], [False])
+    check_mask_overlay.labels[0].set_fontsize(7)
+
+    _mask_overlay = {"artist": None}
+
+    def _draw_mask_overlay():
+        if _mask_overlay["artist"] is not None:
+            artist = _mask_overlay["artist"]
+            # matplotlib >= 3.10 removed QuadContourSet.collections: the
+            # contour set itself is now directly removable. Older versions
+            # still expose a list of Collection sub-artists that each need
+            # removing individually. Support both.
+            if hasattr(artist, "collections"):
+                for coll in artist.collections:
+                    coll.remove()
+            else:
+                artist.remove()
+            _mask_overlay["artist"] = None
+        if mask is not None and check_mask_overlay.get_status()[0]:
+            z = int(slice_slider.val)
+            _mask_overlay["artist"] = ax.contour(
+                mask[:, :, z].astype(float), levels=[0.5],
+                colors="red", linewidths=1.2, origin="lower",
+                # NOTE: counter-intuitive but verified empirically —
+                # ax.contour()'s `origin` parameter does not use the same
+                # convention as ax.imshow()'s. origin="upper" here produces
+                # a vertical mirror of the mask relative to the image
+                # (flipped around row n/2), even though "upper" is what
+                # matches imshow. origin="lower" is the one that actually
+                # aligns row-for-row with imshow's default display. This
+                # only affected the visual overlay — mask_rician, the
+                # fits, and the CSV export never call contour() and were
+                # never affected.
+            )
+
+    def _on_mask_overlay_toggle(label):
+        _draw_mask_overlay()
+        fig.canvas.draw_idle()
+
+    check_mask_overlay.on_clicked(_on_mask_overlay_toggle)
+
     # ── Selection controls (shape / action / propagation) ───────────────────
     # Hidden by default, shown only while "Select" mode is active — avoids
     # cluttering the figure the rest of the time.
-    from matplotlib.widgets import CheckButtons, EllipseSelector, RadioButtons, RectangleSelector
+    from matplotlib.widgets import (
+        CheckButtons,
+        EllipseSelector,
+        RadioButtons,
+        RectangleSelector,
+    )
 
-    ax_shape = fig.add_axes([0.01, 0.80, 0.16, 0.13])
+    ax_shape = fig.add_axes([0.01, 0.785, 0.13, 0.13])
     ax_shape.set_title("Shape", fontsize=8)
     radio_shape = RadioButtons(ax_shape, ("Lasso", "Box", "Circle"))
     for lbl in radio_shape.labels:
         lbl.set_fontsize(7)
 
-    ax_action = fig.add_axes([0.01, 0.65, 0.16, 0.11])
+    ax_action = fig.add_axes([0.01, 0.605, 0.13, 0.15])
     ax_action.set_title("Action", fontsize=8)
-    radio_action = RadioButtons(ax_action, ("Exclude", "Flag capillary"))
+    radio_action = RadioButtons(ax_action, ("Average + Fit", "Exclude", "Flag capillary"))
     for lbl in radio_action.labels:
         lbl.set_fontsize(7)
 
-    ax_propagate = fig.add_axes([0.01, 0.58, 0.16, 0.05])
+    ax_propagate = fig.add_axes([0.01, 0.545, 0.13, 0.05])
     check_propagate = CheckButtons(ax_propagate, ["All slices"], [False])
     check_propagate.labels[0].set_fontsize(7)
 
     for a in (ax_shape, ax_action, ax_propagate):
         a.set_visible(False)
+    radio_shape.active = False
+    radio_action.active = False
+    check_propagate.active = False
 
     # ── Buttons ───────────────────────────────────────────────────────────────
     # 10 buttons on one row: width + gap chosen so they all fit from x=0.05 to x=0.93
@@ -241,12 +308,136 @@ def display_slice(data, te, mask=None):
         rows, cols = np.mgrid[0:nx, 0:ny]
         return np.column_stack((cols.ravel(), rows.ravel())), (nx, ny)
 
+    # ── Shared 4-model fit + AIC comparison + decay-curve plot ──────────────
+    # Used by both the single-voxel click ("Fit" mode) and the ROI-averaged
+    # fit ("Average + Fit" selection action), so the two stay consistent.
+
+    def _fit_and_plot(signal, title, header_lines=()):
+        p_mono,  f_mono,  _ = fit_mono(te, signal)
+        p_off,   f_off,   _ = fit_mono_offset(te, signal)
+        p_bi,    f_bi,    _ = fit_bi(te, signal)
+        p_bioff, f_bioff, _ = fit_bi_offset(te, signal)
+
+        aic_mono  = compute_aic(signal, f_mono,  2)
+        aic_off   = compute_aic(signal, f_off,   3)
+        aic_bi    = compute_aic(signal, f_bi,    4)
+        aic_bioff = compute_aic(signal, f_bioff, 5)
+
+        r2_mono  = compute_r2(signal, f_mono)
+        r2_off   = compute_r2(signal, f_off)
+        r2_bi    = compute_r2(signal, f_bi)
+        r2_bioff = compute_r2(signal, f_bioff)
+
+        rmse_mono  = compute_rmse(signal, f_mono)
+        rmse_off   = compute_rmse(signal, f_off)
+        rmse_bi    = compute_rmse(signal, f_bi)
+        rmse_bioff = compute_rmse(signal, f_bioff)
+
+        aic_dict = {
+            "mono": aic_mono, "mono+offset": aic_off,
+            "bi": aic_bi,     "bi+offset":   aic_bioff,
+        }
+        best_model = min(aic_dict, key=aic_dict.get)
+
+        sep = "─" * 58
+        print(f"\n{sep}")
+        for line in header_lines:
+            print(f"  {line}")
+        print(sep)
+        print(f"  {'Model':<18} {'I0':>8} {'T2':>7} {'AIC':>8} {'R²':>6} {'RMSE':>8}")
+        print(sep)
+
+        def _row(name, params, aic, r2, rmse, extra=""):
+            if params is None:
+                return f"  {name:<18} {'—':>8} {'—':>7} {'—':>8} {'—':>6} {'—':>8}"
+            I0 = params.get("I0", float("nan"))
+            T2 = params.get("T2", params.get("T2c", float("nan")))
+            star = " ★" if name == best_model else ""
+            return (
+                f"  {name:<18} {I0:>8.1f} {T2:>7.2f} {aic:>8.1f} "
+                f"{r2:>6.3f} {rmse:>8.1f}{extra}{star}"
+            )
+
+        print(_row("mono",        p_mono,  aic_mono,  r2_mono,  rmse_mono))
+        print(_row("mono+offset", p_off,   aic_off,   r2_off,   rmse_off,
+                   f"  C={p_off['C']:.1f}" if p_off else ""))
+        print(_row("bi", p_bi, aic_bi, r2_bi, rmse_bi,
+                   f"  f={p_bi['f']:.2f} T2l={p_bi['T2l']:.1f}" if p_bi else ""))
+        print(_row("bi+offset", p_bioff, aic_bioff, r2_bioff, rmse_bioff,
+                   (f"  f={p_bioff['f']:.2f} T2l={p_bioff['T2l']:.1f}"
+                    f" C={p_bioff['C']:.1f}") if p_bioff else ""))
+        print(sep)
+        print(f"  Best model (AIC): {best_model}")
+        print(sep)
+
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        ax2.plot(te, signal, "o", color="black", label="data", zorder=5)
+
+        model_fits = [
+            ("mono",        f_mono,  aic_mono),
+            ("mono+offset", f_off,   aic_off),
+            ("bi",          f_bi,    aic_bi),
+            ("bi+offset",   f_bioff, aic_bioff),
+        ]
+        for name, fitted, aic in model_fits:
+            if fitted is None:
+                continue
+            is_best  = (name == best_model)
+            lw       = 2.5 if is_best else 1.2
+            label    = f"★ {name} (AIC={aic:.1f})" if is_best else f"{name} (AIC={aic:.1f})"
+            ax2.plot(te, fitted, color=_FIT_COLORS[name],
+                     linewidth=lw, label=label, zorder=4 if is_best else 3)
+
+        ax2.set_xlabel("Echo time (ms)")
+        ax2.set_ylabel("Signal intensity")
+        ax2.set_title(title)
+        ax2.legend(fontsize=8)
+        fig2.tight_layout()
+        fig2.canvas.draw_idle()
+        fig2.show()
+        plt.pause(0.001)
+
+        return best_model, {
+            "mono": p_mono, "mono+offset": p_off,
+            "bi": p_bi, "bi+offset": p_bioff,
+        }
+
     def _apply_selection(inside):
-        """Apply the current action (exclude/flag) over `inside` (nx, ny bool
-        mask, array convention), on the current slice or all slices."""
+        """Apply the current action (exclude/flag/average+fit) over `inside`
+        (nx, ny bool mask, array convention), on the current slice or all
+        slices."""
         action = radio_action.value_selected
         propagate = check_propagate.get_status()[0]
         z_list = range(mask.shape[2]) if propagate else [int(slice_slider.val)]
+
+        if action == "Average + Fit":
+            voxel_signals = []
+            for z in z_list:
+                sel = inside & mask[:, :, z]
+                xs, ys = np.nonzero(sel)
+                for vx, vy in zip(xs, ys):
+                    voxel_signals.append(data[vx, vy, z, :])
+
+            mode["value"] = None
+            _selector["obj"] = None
+            _reset_buttons()
+            fig.canvas.draw_idle()
+
+            if not voxel_signals:
+                print("[Select] Average + Fit: no voxel of the mask falls inside "
+                      "the drawn region — nothing to fit.")
+                return
+
+            mean_signal = np.mean(voxel_signals, axis=0)
+            scope = "all slices" if propagate else f"slice z={int(slice_slider.val)}"
+            _fit_and_plot(
+                mean_signal,
+                title=f"ROI-averaged fit — n={len(voxel_signals)} voxel(s), {scope}",
+                header_lines=[
+                    f"ROI average | n={len(voxel_signals)} voxel(s) | {scope}",
+                ],
+            )
+            return
 
         n_total = 0
         for z in z_list:
@@ -269,6 +460,7 @@ def display_slice(data, te, mask=None):
         mode["value"] = None
         _selector["obj"] = None
         _reset_buttons()
+        _draw_mask_overlay()
         fig.canvas.draw_idle()
 
     def _on_lasso_select(verts):
@@ -286,9 +478,16 @@ def display_slice(data, te, mask=None):
 
     def _on_circle_select(eclick, erelease):
         nx, ny = mask.shape[0], mask.shape[1]
-        cx, cy = eclick.xdata, eclick.ydata
-        rx = abs(erelease.xdata - eclick.xdata)
-        ry = abs(erelease.ydata - eclick.ydata)
+        # EllipseSelector reports eclick/erelease as the two opposite
+        # corners of the bounding box (same convention as
+        # RectangleSelector) — NOT a center + drag-radius. Using eclick
+        # directly as the center produced a circle offset from what was
+        # actually drawn, which is why voxels near the true edge were
+        # missed.
+        cx = (eclick.xdata + erelease.xdata) / 2
+        cy = (eclick.ydata + erelease.ydata) / 2
+        rx = abs(erelease.xdata - eclick.xdata) / 2
+        ry = abs(erelease.ydata - eclick.ydata) / 2
         rows, cols = np.mgrid[0:nx, 0:ny]
         inside = ((cols - cx) / max(rx, 1e-9)) ** 2 + ((rows - cy) / max(ry, 1e-9)) ** 2 <= 1
         _apply_selection(inside)
@@ -327,6 +526,9 @@ def display_slice(data, te, mask=None):
             _selector["obj"] = None
         for a in (ax_shape, ax_action, ax_propagate):
             a.set_visible(False)
+        radio_shape.active = False
+        radio_action.active = False
+        check_propagate.active = False
         _reset_buttons()
         fig.canvas.draw_idle()
 
@@ -334,7 +536,7 @@ def display_slice(data, te, mask=None):
 
     # ── Button callbacks ──────────────────────────────────────────────────────
 
-    def make_callback(button):  # noqa: C901  (complexity is inherent here)
+    def make_callback(button):
         def toggle_mode(event):
             _reset_buttons()
 
@@ -361,11 +563,17 @@ def display_slice(data, te, mask=None):
                         _selector["obj"] = None
                     for a in (ax_shape, ax_action, ax_propagate):
                         a.set_visible(False)
+                    radio_shape.active = False
+                    radio_action.active = False
+                    check_propagate.active = False
                 else:
                     mode["value"] = "select"
                     _set_button(button_select, "#7bff23")
                     for a in (ax_shape, ax_action, ax_propagate):
                         a.set_visible(True)
+                    radio_shape.active = True
+                    radio_action.active = True
+                    check_propagate.active = True
                     _activate_selector()
                     print("[Select] Draw on the image with the chosen shape. "
                           "Pick action/shape/propagation on the left before drawing.")
@@ -584,6 +792,7 @@ def display_slice(data, te, mask=None):
                 )
                 axes[0, 0].set_title("Best model (AIC)")
                 axes[0, 0].axis("off")
+                _use_array_coords(axes[0, 0], aic_map)
                 patches = [
                     mpatches.Patch(color=_AIC_COLORS[i], label=_AIC_LABELS[i])
                     for i in range(4)
@@ -607,6 +816,7 @@ def display_slice(data, te, mask=None):
                 axes[0, 1].set_title("Smoothed image (σ=1.5, echo 0)")
                 axes[0, 1].axis("off")
                 fig_u.colorbar(im_s, ax=axes[0, 1], fraction=0.046)
+                _use_array_coords(axes[0, 1], vol_smooth)
 
                 for ax_u, arr, title in [
                     (axes[1, 0], f_bi_map,    "Water fraction f (bi)\nrestricted vs free"),
@@ -619,6 +829,7 @@ def display_slice(data, te, mask=None):
                     ax_u.set_title(title)
                     ax_u.axis("off")
                     fig_u.colorbar(im_f, ax=ax_u, fraction=0.046)
+                    _use_array_coords(ax_u, arr)
 
                 finite_i0 = i0_voxelwise[np.isfinite(i0_voxelwise)]
                 vmin_i0 = np.percentile(finite_i0, 1)  if len(finite_i0) > 0 else None
@@ -639,6 +850,7 @@ def display_slice(data, te, mask=None):
                 axes[2, 1].set_title(f"I0 global ({global_best})")
                 axes[2, 1].axis("off")
                 fig_u.colorbar(im_i0g, ax=axes[2, 1], fraction=0.046)
+                _use_array_coords(axes[2, 1], i0_global)
 
                 plt.tight_layout()
                 plt.show()
@@ -668,7 +880,6 @@ def display_slice(data, te, mask=None):
                     print(f"Noise maps done in {t_elapsed:.1f} s")
                     cache[cache_key] = (c_mono_off, c_bi_off, t_elapsed)
 
-                estimate_noise(data)
                 _set_button(button, "#7bff23")
 
                 fig_n, axes = plt.subplots(3, 2, figsize=(10, 12))
@@ -681,6 +892,7 @@ def display_slice(data, te, mask=None):
                         mask[:, :, z], cmap="gray",
                         origin="upper", interpolation="nearest",
                     )
+                    _use_array_coords(axes[0, 1], mask[:, :, z])
                 axes[0, 1].set_title(f"Tissue mask — z={z}")
                 axes[0, 1].axis("off")
 
@@ -694,6 +906,7 @@ def display_slice(data, te, mask=None):
                     axes[row, 0].set_title(title)
                     axes[row, 0].axis("off")
                     fig_n.colorbar(im_c, ax=axes[row, 0], fraction=0.046)
+                    _use_array_coords(axes[row, 0], arr)
 
                     c_vals_all = arr[np.isfinite(arr)]
                     # curve_fit rarely returns an exact 0.0 when hitting the
@@ -808,7 +1021,7 @@ def display_slice(data, te, mask=None):
                         finite_v = arr[np.isfinite(arr)]
                         if len(finite_v) > 0:
                             mu = np.mean(finite_v)
-                            fmt = f".3f" if label == "R²" else ".1f"
+                            fmt = ".3f" if label == "R²" else ".1f"
                             ax_dist.hist(finite_v, bins=60, density=True,
                                          alpha=0.5, color=color,
                                          label=f"{label_d} µ={mu:{fmt}}")
@@ -844,25 +1057,36 @@ def display_slice(data, te, mask=None):
                 )
                 vol_plot = np.nan_to_num(vol_masked, nan=0.0)
 
+                if voxel_dims is not None:
+                    dx, dy, dz = voxel_dims
+                    x_coords, y_coords, z_coords = x_idx * dx, y_idx * dy, z_idx * dz
+                    axis_titles = {
+                        "xaxis_title": "X (mm)", "yaxis_title": "Y (mm)",
+                        "zaxis_title": "Z (mm)",
+                    }
+                else:
+                    x_coords, y_coords, z_coords = x_idx, y_idx, z_idx
+                    axis_titles = {
+                        "xaxis_title": "X (voxels)", "yaxis_title": "Y (voxels)",
+                        "zaxis_title": "Z (slice index)",
+                    }
+
                 fig_3d = go.Figure(data=go.Volume(
-                    x=x_idx.flatten(),
-                    y=y_idx.flatten(),
-                    z=z_idx.flatten(),
+                    x=x_coords.flatten(),
+                    y=y_coords.flatten(),
+                    z=z_coords.flatten(),
                     value=vol_plot.flatten(),
                     isomin=iso_min,
                     isomax=iso_max,
                     opacity=0.15,
                     surface_count=20,
                     colorscale="Viridis",
-                    caps=dict(x_show=False, y_show=False, z_show=False),
+                    caps={"x_show": False, "y_show": False, "z_show": False},
                 ))
                 fig_3d.update_layout(
                     title=f"3D view — echo 0 | threshold {iso_min:.0f}–{iso_max:.0f}",
-                    scene=dict(
-                        xaxis_title="X", yaxis_title="Y", zaxis_title="Z (slice)",
-                        aspectmode="data",
-                    ),
-                    margin=dict(l=0, r=0, t=40, b=0),
+                    scene={**axis_titles, "aspectmode": "data"},
+                    margin={"l": 0, "r": 0, "t": 40, "b": 0},
                 )
                 _set_button(button, "#7bff23")
                 fig_3d.show()
@@ -907,11 +1131,28 @@ def display_slice(data, te, mask=None):
                         if idx in names and isinstance(arr, np.ndarray) and arr.ndim == 2:
                             maps_dict[names[idx]] = arr
 
-                if maps_dict and capillary_mask is not None:
+                if maps_dict and capillary_mask is not None and capillary_mask[:, :, z].any():
                     # 1 = voxel flagged as capillary via the Select tool,
-                    # 0 = sample tissue. Lets downstream analysis filter
-                    # capillary vs. sample rows without losing either.
+                    # 0 = sample tissue. Only added when at least one voxel
+                    # was actually flagged on this slice — an always-0
+                    # column would look like "no capillary found" (a
+                    # computed result) rather than "never asked" (the
+                    # actual reason), which is misleading.
                     maps_dict["is_capillary"] = capillary_mask[:, :, z].astype(float)
+
+                if maps_dict and voxel_dims is not None:
+                    # Real-world position in mm, same array convention as
+                    # everywhere else (x=row, y=col). Without this, every
+                    # exported row only had raw voxel indices — no way to
+                    # know the physical size of anything (a capillary, the
+                    # sillon...) without also knowing the acquisition's
+                    # voxel size, which lived nowhere in the pipeline.
+                    dx, dy, dz = voxel_dims
+                    nx_e, ny_e = mask.shape[0], mask.shape[1]
+                    rows, cols = np.mgrid[0:nx_e, 0:ny_e]
+                    maps_dict["x_mm"] = rows * dx
+                    maps_dict["y_mm"] = cols * dy
+                    maps_dict["z_mm"] = np.full((nx_e, ny_e), z * dz)
 
                 if not maps_dict:
                     print(
@@ -996,94 +1237,20 @@ def display_slice(data, te, mask=None):
         if event.inaxes is not ax:
             return
 
-        x = int(event.xdata)
-        y = int(event.ydata)
-        signal = data[y, x, int(slice_slider.val), :]
+        col = int(event.xdata)   # plot x = array column
+        row = int(event.ydata)   # plot y = array row
+        z = int(slice_slider.val)
+        signal = data[row, col, z, :]
 
-        p_mono,  f_mono,  _ = fit_mono(te, signal)
-        p_off,   f_off,   _ = fit_mono_offset(te, signal)
-        p_bi,    f_bi,    _ = fit_bi(te, signal)
-        p_bioff, f_bioff, _ = fit_bi_offset(te, signal)
-
-        aic_mono  = compute_aic(signal, f_mono,  2)
-        aic_off   = compute_aic(signal, f_off,   3)
-        aic_bi    = compute_aic(signal, f_bi,    4)
-        aic_bioff = compute_aic(signal, f_bioff, 5)
-
-        r2_mono  = compute_r2(signal, f_mono)
-        r2_off   = compute_r2(signal, f_off)
-        r2_bi    = compute_r2(signal, f_bi)
-        r2_bioff = compute_r2(signal, f_bioff)
-
-        rmse_mono  = compute_rmse(signal, f_mono)
-        rmse_off   = compute_rmse(signal, f_off)
-        rmse_bi    = compute_rmse(signal, f_bi)
-        rmse_bioff = compute_rmse(signal, f_bioff)
-
-        aic_dict   = {
-            "mono": aic_mono, "mono+offset": aic_off,
-            "bi": aic_bi,     "bi+offset":   aic_bioff,
-        }
-        best_model = min(aic_dict, key=aic_dict.get)
-
-        # ── Terminal summary ──────────────────────────────────────────────────
-        sep = "─" * 58
-        print(f"\n{sep}")
-        print(f"  Voxel ({x}, {y}) | slice z={int(slice_slider.val)}")
-        print(sep)
-        print(f"  {'Model':<18} {'I0':>8} {'T2':>7} {'AIC':>8} {'R²':>6} {'RMSE':>8}")
-        print(sep)
-
-        def _row(name, params, aic, r2, rmse, extra=""):
-            if params is None:
-                return f"  {name:<18} {'—':>8} {'—':>7} {'—':>8} {'—':>6} {'—':>8}"
-            I0 = params.get("I0", float("nan"))
-            T2 = params.get("T2", params.get("T2c", float("nan")))
-            star = " ★" if name == best_model else ""
-            return (
-                f"  {name:<18} {I0:>8.1f} {T2:>7.2f} {aic:>8.1f} "
-                f"{r2:>6.3f} {rmse:>8.1f}{extra}{star}"
-            )
-
-        print(_row("mono",        p_mono,  aic_mono,  r2_mono,  rmse_mono))
-        print(_row("mono+offset", p_off,   aic_off,   r2_off,   rmse_off,
-                   f"  C={p_off['C']:.1f}" if p_off else ""))
-        print(_row("bi", p_bi, aic_bi, r2_bi, rmse_bi,
-                   f"  f={p_bi['f']:.2f} T2l={p_bi['T2l']:.1f}" if p_bi else ""))
-        print(_row("bi+offset", p_bioff, aic_bioff, r2_bioff, rmse_bioff,
-                   (f"  f={p_bioff['f']:.2f} T2l={p_bioff['T2l']:.1f}"
-                    f" C={p_bioff['C']:.1f}") if p_bioff else ""))
-        print(sep)
-        print(f"  Best model (AIC): {best_model}")
-        print(sep)
-
-        # ── Decay curve plot ──────────────────────────────────────────────────
-        fig2, ax2 = plt.subplots(figsize=(7, 4))
-        ax2.plot(te, signal, "o", color="black", label="data", zorder=5)
-
-        model_fits = [
-            ("mono",        f_mono,  aic_mono),
-            ("mono+offset", f_off,   aic_off),
-            ("bi",          f_bi,    aic_bi),
-            ("bi+offset",   f_bioff, aic_bioff),
-        ]
-        for name, fitted, aic in model_fits:
-            if fitted is None:
-                continue
-            is_best  = (name == best_model)
-            lw       = 2.5 if is_best else 1.2
-            label    = f"★ {name} (AIC={aic:.1f})" if is_best else f"{name} (AIC={aic:.1f})"
-            ax2.plot(te, fitted, color=_FIT_COLORS[name],
-                     linewidth=lw, label=label, zorder=4 if is_best else 3)
-
-        ax2.set_xlabel("Echo time (ms)")
-        ax2.set_ylabel("Signal intensity")
-        ax2.set_title(f"Voxel ({x}, {y}) — slice z={int(slice_slider.val)}")
-        ax2.legend(fontsize=8)
-        fig2.tight_layout()
-        fig2.canvas.draw_idle()
-        fig2.show()
-        plt.pause(0.001)
+        # Labelled (x, y) here in the ARRAY convention used everywhere else
+        # (mask[x, y, z], the hover readout, and the CSV export: x=row,
+        # y=column) — not matplotlib's plot-coordinate convention. Same
+        # voxel as before, just a label that now matches the rest of the UI.
+        _fit_and_plot(
+            signal,
+            title=f"Voxel (x={row}, y={col}) — slice z={z}",
+            header_lines=[f"Voxel (x={row}, y={col}) | slice z={z}"],
+        )
 
     fig.canvas.mpl_connect("button_press_event", onclick)
     plt.show()
