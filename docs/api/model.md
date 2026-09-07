@@ -1,3 +1,0 @@
-# model
-
-::: functions.model
