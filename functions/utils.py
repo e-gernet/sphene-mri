@@ -9,11 +9,11 @@ This module provides:
 """
 
 import contextlib
+
 import joblib
 import numpy as np
 from scipy import ndimage
 from scipy.signal import savgol_filter
-
 
 # ── joblib / tqdm ─────────────────────────────────────────────────────────────
 
@@ -288,10 +288,15 @@ def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0):
         split), returned so it can be reused (e.g. plotted) without
         re-running Otsu. Note this mask does not reflect the clipping
         step, which only affects the returned statistics.
+    clipped_values : np.ndarray, 1-D
+        The exact 1-D array of intensities that produced ``mean``/``std``
+        (background, Otsu-split, post sigma-clip). Kept so a histogram of
+        "the noise we actually measured" can be drawn without silently
+        falling back to a different (e.g. corner-based) population.
 
     Examples
     --------
-    >>> mean, std, bg = estimate_noise_auto(data)
+    >>> mean, std, bg, clipped = estimate_noise_auto(data)
     >>> print(f"[Noise] auto mean={mean:.1f} std={std:.1f}")
     """
     from skimage.filters import threshold_otsu
@@ -317,7 +322,7 @@ def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0):
         f"Std: {std:.4f} | n={clipped.size}/{bg_values.size} background "
         f"voxels kept"
     )
-    return mean, std, background_mask
+    return mean, std, background_mask, clipped
 
 
 # ── Pre-processing filters ────────────────────────────────────────────────────
@@ -564,7 +569,7 @@ def mask_rician(data, background="auto", corner_fraction=0.05, k=4.0, use_morpho
     vol = np.max(data, axis=-1) if data.ndim == 4 else data
 
     if background == "auto":
-        _, _, bg_mask = estimate_noise_auto(vol)
+        _, _, bg_mask, _ = estimate_noise_auto(vol)
         bg_values = vol[bg_mask]
         bg_values = bg_values[bg_values > 0]
         sigma_rician = np.mean(bg_values) / np.sqrt(np.pi / 2)
