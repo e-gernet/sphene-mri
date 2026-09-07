@@ -1,3 +1,5 @@
+> 🏠 [Retour à l'accueil du projet](https://github.com/e-gernet/sphene-mri) — description des versions disponibles (`mpl` / `pyqt`).
+
 # Sphene MRI
 
 Pipeline d'analyse de relaxométrie T2 pour des données IRM de plantes
@@ -15,9 +17,14 @@ Pipeline d'analyse de relaxométrie T2 pour des données IRM de plantes
   avec offset, bi-exponentiel, bi-exponentiel avec offset
 - Sélection de modèle par critère d'information d'Akaike (AIC)
 - Cartographies paramétriques voxel par voxel (T2, I0, fractions, erreurs)
+- Sélection interactive (lasso / rectangle / cercle) pour exclure des voxels
+  du masque, les flaguer (ex: capillaires), ou lancer un fit moyenné sur une
+  région
 - Export des cartes calculées en tableau CSV (une ligne par voxel), filtré
-  sur le masque tissulaire et auto-vérifié à l'écriture
-- Visualisation interactive 2D (matplotlib) et 3D (Plotly)
+  sur le masque tissulaire, avec coordonnées physiques (mm) et
+  auto-vérification à l'écriture
+- Visualisation interactive 2D (matplotlib) et 3D (Plotly), à l'échelle
+  physique réelle
 
 ## Prérequis
 
@@ -69,6 +76,7 @@ curl -fsSL https://pixi.sh/install.sh | bash
 ```bash
 git clone https://github.com/e-gernet/sphene-mri.git
 cd sphene-mri
+git checkout mpl
 pixi install
 ```
 
@@ -113,7 +121,8 @@ pixi run -e dev docs
 
 Projet en développement actif, dans le cadre d'un travail de recherche INRAE
 sur l'analyse de données IRM de tissus végétaux. Les fonctionnalités de
-diffusion (DWI) seront ajoutées dans une prochaine version.
+diffusion (DWI) seront ajoutées dans une prochaine version. La version PyQt
+est en préparation.
 
 ## Licence
 
