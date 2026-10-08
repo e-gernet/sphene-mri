@@ -72,8 +72,10 @@ La fenêtre principale affiche le volume avec deux curseurs :
 | **Error**    | Cartes R² et RMSE, voxel-wise et avec modèle global. |
 | **Noise**    | Histogramme du bruit de fond, cartes de l'offset C (zéros exclus du calcul de moyenne, seuil à 1.0 pour écarter les solutions bornées). |
 | **3D View**  | Rendu volumique interactif (ouvre dans le navigateur). |
+| **Select**   | Ouvre le panneau de sélection de zones (voir la section suivante). |
+| **Restore mask** | Revient au masque automatique sur toutes les coupes (annule Exclude et Fit only), efface les drapeaux capillaires et vide les cartes en cache. |
 | **Export**   | Exporte toutes les cartes déjà calculées pour la coupe affichée en un CSV unique, format long (voir ci-dessous). |
-| **Reset**    | Réinitialise les curseurs et l'état des boutons. |
+| **Reset**    | Réinitialise les curseurs et l'état des boutons. Ne touche pas au masque : utiliser **Restore mask**. |
 
 !!! tip "Cache par slice"
     Chaque calcul (Mono Map, Bi Map, etc.) est mis en cache par slice. Changer
@@ -84,6 +86,37 @@ La fenêtre principale affiche le volume avec deux curseurs :
     Error, I0), la barre d'outils matplotlib affiche `x=... y=...`
     directement alignés sur l'indexation utilisée dans les CSV exportés —
     pas besoin d'inverser les coordonnées manuellement.
+
+### Sélection de zones (bouton Select)
+
+Le bouton **Select** fait apparaître trois réglages à gauche de l'image :
+
+- **Shape** : forme du tracé, *Lasso* (à main levée), *Box* (rectangle) ou
+  *Circle* (cercle ou ellipse).
+- **Action** : ce qu'on fait de la zone tracée (liste ci-dessous).
+- **All slices** : si coché, l'action s'applique à toutes les coupes au lieu de
+  la coupe affichée.
+
+Le mode reste actif après chaque tracé (le bouton **Select** reste vert) :
+on peut enchaîner plusieurs zones. Il se ferme en cliquant sur un autre
+bouton. Seuls les voxels du masque tissulaire comptent ; le fond n'est
+jamais pris en compte.
+
+| Action | Effet |
+|--------|-------|
+| **Average + Fit** | Moyenne les signaux des voxels de la zone, puis ajuste les 4 modèles sur cette moyenne. Une fenêtre montre la courbe et les 4 ajustements, la console affiche le tableau (I0, T2, AIC, R², RMSE) avec le meilleur modèle ★. Les coordonnées de la zone sont conservées (voir Export). |
+| **Exclude** | Retire les voxels de la zone du masque. Les cartes et l'export suivants ne les contiennent plus (cartes de la coupe concernée à recalculer). |
+| **Fit only** | Inverse d'Exclude : garde **uniquement** les voxels de la zone, tous les autres sortent du masque. Une nouvelle zone *Fit only* remplace la précédente. Les voxels déjà retirés par *Exclude* restent exclus. |
+| **Flag capillary** | Marque les voxels comme capillaire (tube de référence). L'export ajoute une colonne `is_capillary` (1 = capillaire), seulement si au moins un voxel est marqué sur la coupe. |
+| **Show signal** | Affiche le signal brut de la zone, **sans aucun ajustement** : une courbe par voxel (gris), la moyenne (noir), une bande ± 1 écart-type et le plancher de bruit attendu σ√(π/2) (pointillé orange). Deux graphiques : échelle linéaire, et échelle logarithmique où une décroissance mono-exponentielle est une droite (une courbure indique plusieurs composantes). |
+
+!!! tip "Revenir en arrière"
+    **Restore mask** annule *Exclude*, *Fit only* et *Flag capillary* d'un
+    coup. **Reset** ne touche pas au masque.
+
+!!! note "Coordonnées"
+    `x` est la ligne et `y` la colonne du tableau, comme dans les CSV et dans
+    la barre d'outils matplotlib.
 
 ## 7. Export des résultats
 
