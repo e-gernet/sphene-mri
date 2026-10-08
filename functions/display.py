@@ -42,7 +42,7 @@ from matplotlib.path import Path as MplPath
 from matplotlib.widgets import Button, LassoSelector, Slider
 from scipy.ndimage import gaussian_filter
 
-from .io import export_table
+from .io import export_rois, export_table
 from .mapping import (
     _fit_voxel_bi,
     _fit_voxel_error,
@@ -135,6 +135,9 @@ def display_slice(data, te, mask=None, voxel_dims=None):
     # Separate from `mask`: flagged voxels stay IN the tissue mask (still
     # fitted/exported) but are tagged, e.g. capillary vs sample.
     capillary_mask = np.zeros_like(mask, dtype=bool) if mask is not None else None
+    # Every "Average + Fit" region drawn in this session: voxel coordinates + fit
+    # results, written next to the map CSV by the Export button.
+    roi_list = []
     # Tissue mask WITHOUT any "Fit only" restriction. "Exclude" edits both it and
     # `mask`; "Fit only" always restarts from it, so successive "Fit only" zones
     # are independent of each other (but excluded voxels stay excluded).
@@ -257,7 +260,9 @@ def display_slice(data, te, mask=None, voxel_dims=None):
 
     ax_action = fig.add_axes([0.01, 0.603, 0.13, 0.18])
     ax_action.set_title("Action", fontsize=8)
-    radio_action = RadioButtons(ax_action, ("Average + Fit", "Exclude", "Fit only", "Flag capillary"))
+    radio_action = RadioButtons(
+        ax_action, ("Average + Fit", "Exclude", "Fit only", "Flag capillary", "Show signal"),
+    )
     for lbl in radio_action.labels:
         lbl.set_fontsize(7)
 
@@ -431,6 +436,51 @@ def display_slice(data, te, mask=None, voxel_dims=None):
             "bi": p_bi, "bi+offset": p_bioff,
         }
 
+    # ── Raw signal of a zone (no fit) ────────────────────────────────────────
+
+    def _show_signal(signals, scope):
+        """Plot the raw decay curves of the voxels of a zone, with no fit.
+
+        ``signals`` is (n_voxels, n_echoes). Left: linear scale. Right: same
+        data with a logarithmic signal axis, where a single exponential decay
+        is a straight line and a bi-exponential one is a curve that flattens.
+        Thin grey lines = individual voxels (at most 200 drawn), black =
+        mean of the zone, grey band = mean ± 1 standard deviation across
+        voxels, dashed orange = expected noise floor sigma*sqrt(pi/2)."""
+        n_vox = signals.shape[0]
+        mean = signals.mean(axis=0)
+        std = signals.std(axis=0)
+        floor = sigma_noise * np.sqrt(np.pi / 2)
+
+        fig3, (axl, axg) = plt.subplots(1, 2, figsize=(11, 4.2))
+        shown = signals if n_vox <= 200 else signals[
+            np.random.default_rng(0).choice(n_vox, 200, replace=False)
+        ]
+        for ax_i in (axl, axg):
+            for curve in shown:
+                ax_i.plot(te, curve, color="0.6", alpha=0.25, linewidth=0.7)
+            ax_i.fill_between(te, np.maximum(mean - std, 1e-9), mean + std,
+                              color="0.5", alpha=0.25, linewidth=0)
+            ax_i.plot(te, mean, "o-", color="black", markersize=3.5, linewidth=1.5,
+                      label=f"mean of {n_vox} voxel(s)", zorder=5)
+            ax_i.axhline(floor, color="darkorange", linestyle="--", linewidth=1.2,
+                         label=f"expected noise floor ({floor:.0f})")
+            ax_i.set_xlabel("Echo time (ms)")
+            ax_i.set_ylabel("Signal intensity")
+        axl.set_title("Linear scale")
+        axg.set_yscale("log")
+        axg.set_ylim(bottom=floor * 0.5, top=float(np.max(mean + std)) * 1.2)
+        axg.set_title("Log scale (straight line = single exponential)")
+        axl.legend(fontsize=8)
+        fig3.suptitle(f"Raw signal, no fit — {scope}", fontsize=11)
+        fig3.tight_layout()
+        fig3.canvas.draw_idle()
+        fig3.show()
+        plt.pause(0.001)
+
+        print(f"[Signal] {n_vox} voxel(s), {scope}: mean at echo 1 = {mean[0]:.0f}, "
+              f"at last echo = {mean[-1]:.0f} (noise floor {floor:.0f}).")
+
     def _apply_selection(inside):
         """Apply the current action (exclude/fit only/flag/average+fit) over `inside`
         (nx, ny bool mask, array convention), on the current slice or all
@@ -439,31 +489,46 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         propagate = check_propagate.get_status()[0]
         z_list = range(mask.shape[2]) if propagate else [int(slice_slider.val)]
 
-        if action == "Average + Fit":
+        if action in ("Average + Fit", "Show signal"):
             voxel_signals = []
+            roi_coords = []  # (slice, x, y) of every voxel entering the average
             for z in z_list:
                 sel = inside & mask[:, :, z]
                 xs, ys = np.nonzero(sel)
                 for vx, vy in zip(xs, ys):
                     voxel_signals.append(data[vx, vy, z, :])
+                    roi_coords.append((z, int(vx), int(vy)))
 
             # Select mode stays active (button stays green): draw the next ROI directly.
             fig.canvas.draw_idle()
 
             if not voxel_signals:
-                print("[Select] Average + Fit: no voxel of the mask falls inside "
-                      "the drawn region — nothing to fit.")
+                print(f"[Select] {action}: no voxel of the mask falls inside "
+                      "the drawn region — nothing to do.")
+                return
+
+            scope = "all slices" if propagate else f"slice z={int(slice_slider.val)}"
+            if action == "Show signal":
+                _show_signal(np.array(voxel_signals), scope)
                 return
 
             mean_signal = np.mean(voxel_signals, axis=0)
-            scope = "all slices" if propagate else f"slice z={int(slice_slider.val)}"
-            _fit_and_plot(
+            roi_id = len(roi_list) + 1
+            best_model, params = _fit_and_plot(
                 mean_signal,
-                title=f"ROI-averaged fit — n={len(voxel_signals)} voxel(s), {scope}",
+                title=f"ROI #{roi_id} averaged fit — n={len(voxel_signals)} voxel(s), {scope}",
                 header_lines=[
-                    f"ROI average | n={len(voxel_signals)} voxel(s) | {scope}",
+                    f"ROI #{roi_id} average | n={len(voxel_signals)} voxel(s) | {scope}",
                 ],
             )
+            roi_list.append({
+                "id": roi_id, "scope": scope, "coords": roi_coords,
+                "best_model": best_model, "params": params,
+            })
+            arr = np.array(roi_coords)
+            print(f"  ROI #{roi_id} kept in memory: x {arr[:, 1].min()}–{arr[:, 1].max()}, "
+                  f"y {arr[:, 2].min()}–{arr[:, 2].max()} "
+                  f"({len(roi_list)} ROI(s) so far, written to exports/ by the Export button)")
             return
 
         n_total = 0
@@ -1270,7 +1335,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                             rx, ry = int(row[1]), int(row[2])
                             for name in col_names:
                                 expected = maps_dict[name][rx, ry]
-                                got = float(row[col_idx[name]].replace(",", "."))
+                                got = float(row[col_idx[name]])
                                 if not np.isclose(expected, got, atol=1e-6, equal_nan=True):
                                     mismatch = True
                                     print(
@@ -1290,6 +1355,9 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                             f"{written_path}"
                         )
                         _set_button(button, "#7bff23")
+
+                if roi_list:
+                    export_rois(roi_list, Path("exports") / "T2_ROIs")
 
             fig.canvas.draw_idle()
 

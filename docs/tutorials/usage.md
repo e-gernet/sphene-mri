@@ -89,10 +89,15 @@ La fenêtre principale affiche le volume avec deux curseurs :
 
 Un clic sur **Export** génère `exports/T2_slice_z<N>.csv` : une ligne par
 voxel du masque tissulaire, une colonne par grandeur calculée (T2, C, R²,
-AIC, ...). Format compatible Excel français : séparateur `;`, décimales à
-la virgule. Chaque écriture est relue et comparée aux données en mémoire
-avant de confirmer le succès (bouton vert) ou signaler un écart précis
-(bouton rouge, détail en console).
+AIC, ...). Format : séparateur de colonnes `;`, décimales avec un point
+(lecture directe avec `pandas.read_csv(..., sep=";")` ; dans Excel, passer par
+l'import de texte avec le séparateur `;`). Chaque écriture est relue et
+comparée aux données en mémoire avant de confirmer le succès (bouton vert) ou
+signaler un écart précis (bouton rouge, détail en console).
+
+Si des régions ont été analysées avec **Select > Average + Fit**, Export écrit
+aussi `exports/T2_ROIs_voxels.csv` (coordonnées de chaque voxel de chaque
+région) et `exports/T2_ROIs_fits.csv` (résultats des 4 modèles par région).
 
 ## Exemple d'analyse voxel par voxel
 

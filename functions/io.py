@@ -326,12 +326,67 @@ def export_table(maps_dict, z, filepath, mask=None):
                     keep = any(not np.isnan(arr[x, y]) for arr in arrays)
                 if not keep:
                     continue
-                # French Excel convention: comma as decimal separator.
-                row = [z, x, y] + [
-                    f"{arr[x, y]:.6f}".replace(".", ",") for arr in arrays
-                ]
+                # Decimal point (pandas / R / Python / English Excel). The column
+                # separator stays ";" : read with sep=";" (pandas) or the
+                # "Delimited, ;" import wizard in Excel.
+                row = [z, x, y] + [f"{arr[x, y]:.6f}" for arr in arrays]
                 writer.writerow(row)
                 n_rows += 1
 
     print(f"[Export] {n_rows} voxel(s), {len(names)} colonne(s) → {filepath}")
     return filepath, n_rows
+
+def export_rois(roi_list, filepath):
+    """Write the "Average + Fit" regions of the session as two CSV files.
+
+    ``<filepath>_voxels.csv`` : one row per voxel of each ROI (roi;slice;x;y),
+    so the exact region can be found again. ``<filepath>_fits.csv`` : one row
+    per ROI and model (roi;scope;n_voxels;model;best_aic;I0;T2;T2l;f;C), where
+    ``T2`` is the single T2 (mono) or the short T2c (bi). Same conventions as
+    ``export_table`` (decimal point, ``;`` separator, x = row, y = column).
+
+    Parameters
+    ----------
+    roi_list : list[dict]
+        Entries with keys ``id``, ``scope``, ``coords`` (list of (z, x, y)),
+        ``best_model`` and ``params`` (model name -> dict of fitted values
+        or None).
+    filepath : str or os.PathLike
+        Base path (no extension), e.g. ``exports/T2_ROIs``.
+
+    Returns
+    -------
+    (voxels_path, fits_path) : tuple of pathlib.Path
+    """
+    base = Path(filepath)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    voxels_path = base.with_name(base.name + "_voxels.csv")
+    fits_path = base.with_name(base.name + "_fits.csv")
+
+    def fmt(v):
+        return "" if v is None else f"{v:.6f}"
+
+    with open(voxels_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["roi", "slice", "x", "y"])
+        for roi in roi_list:
+            for z, x, y in roi["coords"]:
+                w.writerow([roi["id"], z, x, y])
+
+    with open(fits_path, "w", newline="") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["roi", "scope", "n_voxels", "model", "best_aic",
+                    "I0", "T2", "T2l", "f", "C"])
+        for roi in roi_list:
+            for model, p in roi["params"].items():
+                if p is None:
+                    continue
+                w.writerow([
+                    roi["id"], roi["scope"], len(roi["coords"]), model,
+                    int(model == roi["best_model"]),
+                    fmt(p.get("I0")), fmt(p.get("T2", p.get("T2c"))),
+                    fmt(p.get("T2l")), fmt(p.get("f")), fmt(p.get("C")),
+                ])
+
+    print(f"[Export] {len(roi_list)} ROI(s) → {voxels_path} et {fits_path}")
+    return voxels_path, fits_path
