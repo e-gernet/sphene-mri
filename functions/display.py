@@ -54,7 +54,7 @@ from .mapping import (
     run_parallel,
 )
 from .model import fit_bi, fit_bi_offset, fit_mono, fit_mono_offset
-from .utils import compute_aic, compute_r2, compute_rmse
+from .utils import compute_aic, compute_r2, compute_rmse, estimate_noise_auto, estimate_sigma
 
 # Discrete colour palette for AIC model-selection maps (4 models)
 _AIC_COLORS = ["#4C72B0", "#55A868", "#C44E52", "#8172B2"]
@@ -131,16 +131,23 @@ def display_slice(data, te, mask=None, voxel_dims=None):
     t = 0
     mode   = {"value": None}
     cache  = {}
+    cache_bg = {}   # background mask of the whole volume, computed once (Noise histogram)
     # Separate from `mask`: flagged voxels stay IN the tissue mask (still
     # fitted/exported) but are tagged, e.g. capillary vs sample.
     capillary_mask = np.zeros_like(mask, dtype=bool) if mask is not None else None
+    # Tissue mask WITHOUT any "Fit only" restriction. "Exclude" edits both it and
+    # `mask`; "Fit only" always restarts from it, so successive "Fit only" zones
+    # are independent of each other (but excluded voxels stay excluded).
+    mask_base = mask.copy() if mask is not None else None
+    # Automatic mask as first computed, kept for the "Restore mask" button.
+    mask_original = mask.copy() if mask is not None else None
 
     # ── Main figure ───────────────────────────────────────────────────────────
     fig, ax = plt.subplots()
     plt.subplots_adjust(left=0.2, bottom=0.2)
 
     img  = ax.imshow(data[:, :, z, t], cmap="viridis")
-    cbar = fig.colorbar(img, ax=ax)  # noqa: F841  (kept for layout)
+    fig.colorbar(img, ax=ax)
     _use_array_coords(ax, data[:, :, z, t])
 
     axecho = fig.add_axes([0.25, 0.1, 0.65, 0.03])
@@ -156,9 +163,29 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         orientation="vertical",
     )
 
+    # ── SNR readout (console) ───────────────────────────────────────────────
+    # σ is measured once for the whole acquisition, then SNR is reported
+    # per slice over the tissue mask whenever the slice changes.
+    sigma_noise = estimate_sigma(data)
+    last_snr_slice = {"z": None}
+
+    def _print_snr(z):
+        if mask is None or not mask[:, :, z].any():
+            print(f"[SNR] slice z={z}: no tissue voxel in the mask.")
+            return
+        snr = np.median(data[:, :, z, 0][mask[:, :, z]]) / sigma_noise
+        print(f"[SNR] slice z={z} : SNR = {snr:.1f}  "
+              f"(median tissue signal at echo 1 / background noise)")
+
+    _print_snr(z)
+    last_snr_slice["z"] = z
+
     def update(val):
         img.set_data(data[:, :, slice_slider.val, echo_slider.val])
         _draw_mask_overlay()
+        if last_snr_slice["z"] != int(slice_slider.val):
+            last_snr_slice["z"] = int(slice_slider.val)
+            _print_snr(last_snr_slice["z"])
         fig.canvas.draw_idle()
 
     echo_slider.on_changed(update)
@@ -228,9 +255,9 @@ def display_slice(data, te, mask=None, voxel_dims=None):
     for lbl in radio_shape.labels:
         lbl.set_fontsize(7)
 
-    ax_action = fig.add_axes([0.01, 0.605, 0.13, 0.15])
+    ax_action = fig.add_axes([0.01, 0.603, 0.13, 0.18])
     ax_action.set_title("Action", fontsize=8)
-    radio_action = RadioButtons(ax_action, ("Average + Fit", "Exclude", "Flag capillary"))
+    radio_action = RadioButtons(ax_action, ("Average + Fit", "Exclude", "Fit only", "Flag capillary"))
     for lbl in radio_action.labels:
         lbl.set_fontsize(7)
 
@@ -245,21 +272,22 @@ def display_slice(data, te, mask=None, voxel_dims=None):
     check_propagate.active = False
 
     # ── Buttons ───────────────────────────────────────────────────────────────
-    # 10 buttons on one row: width + gap chosen so they all fit from x=0.05 to x=0.93
-    _btn_w = 0.086
+    # 11 buttons on one row: width + gap chosen so they all fit from x=0.05 to x=0.93
     _btn_gap = 0.004
-    _btn_x = [0.05 + i * (_btn_w + _btn_gap) for i in range(10)]
+    _btn_w = (0.88 - 10 * _btn_gap) / 11
+    _btn_x = [0.05 + i * (_btn_w + _btn_gap) for i in range(11)]
 
-    resetax            = plt.axes([_btn_x[9], 0.05, _btn_w, 0.04])
-    ax_button_fit      = plt.axes([_btn_x[8], 0.05, _btn_w, 0.04])
-    ax_button_bi       = plt.axes([_btn_x[7], 0.05, _btn_w, 0.04])
-    ax_button_mono     = plt.axes([_btn_x[6], 0.05, _btn_w, 0.04])
-    ax_button_utils    = plt.axes([_btn_x[5], 0.05, _btn_w, 0.04])
-    ax_button_error    = plt.axes([_btn_x[4], 0.05, _btn_w, 0.04])
-    ax_button_noise    = plt.axes([_btn_x[3], 0.05, _btn_w, 0.04])
-    ax_button_3d       = plt.axes([_btn_x[2], 0.05, _btn_w, 0.04])
-    ax_button_export   = plt.axes([_btn_x[1], 0.05, _btn_w, 0.04])
+    resetax            = plt.axes([_btn_x[10], 0.05, _btn_w, 0.04])
+    ax_button_fit      = plt.axes([_btn_x[9], 0.05, _btn_w, 0.04])
+    ax_button_bi       = plt.axes([_btn_x[8], 0.05, _btn_w, 0.04])
+    ax_button_mono     = plt.axes([_btn_x[7], 0.05, _btn_w, 0.04])
+    ax_button_utils    = plt.axes([_btn_x[6], 0.05, _btn_w, 0.04])
+    ax_button_error    = plt.axes([_btn_x[5], 0.05, _btn_w, 0.04])
+    ax_button_noise    = plt.axes([_btn_x[4], 0.05, _btn_w, 0.04])
+    ax_button_3d       = plt.axes([_btn_x[3], 0.05, _btn_w, 0.04])
+    ax_button_export   = plt.axes([_btn_x[2], 0.05, _btn_w, 0.04])
     ax_button_select   = plt.axes([_btn_x[0], 0.05, _btn_w, 0.04])
+    ax_button_restore  = plt.axes([_btn_x[1], 0.05, _btn_w, 0.04])
 
     button_reset        = Button(resetax,         "Reset")
     button_fit          = Button(ax_button_fit,   "Fit")
@@ -271,11 +299,12 @@ def display_slice(data, te, mask=None, voxel_dims=None):
     button_3d           = Button(ax_button_3d,    "3D View")
     button_export       = Button(ax_button_export, "Export")
     button_select       = Button(ax_button_select, "Select")
+    button_restore      = Button(ax_button_restore, "Restore\nmask")
 
     _all_buttons = [
         button_fit, button_mono_mapping, button_bi_mapping,
         button_utils, button_error, button_noise, button_3d,
-        button_export, button_select, button_reset,
+        button_export, button_select, button_restore, button_reset,
     ]
     for b in _all_buttons:
         b.label.set_fontsize(7)
@@ -403,7 +432,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         }
 
     def _apply_selection(inside):
-        """Apply the current action (exclude/flag/average+fit) over `inside`
+        """Apply the current action (exclude/fit only/flag/average+fit) over `inside`
         (nx, ny bool mask, array convention), on the current slice or all
         slices."""
         action = radio_action.value_selected
@@ -418,9 +447,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                 for vx, vy in zip(xs, ys):
                     voxel_signals.append(data[vx, vy, z, :])
 
-            mode["value"] = None
-            _selector["obj"] = None
-            _reset_buttons()
+            # Select mode stays active (button stays green): draw the next ROI directly.
             fig.canvas.draw_idle()
 
             if not voxel_signals:
@@ -444,7 +471,18 @@ def display_slice(data, te, mask=None, voxel_dims=None):
             if action == "Exclude":
                 n_total += int(np.sum(inside & mask[:, :, z]))
                 mask[:, :, z] &= ~inside
+                mask_base[:, :, z] &= ~inside
                 # Stale cache for this slice would silently mix old/new masks.
+                for key in [k for k in cache if k[1] == z]:
+                    del cache[key]
+            elif action == "Fit only":
+                # Inverse of Exclude: keep ONLY the voxels inside the drawn
+                # region, drop every other tissue voxel from the mask. Maps,
+                # fits and the CSV export then cover this zone only.
+                # Restarts from mask_base, so a new "Fit only" replaces the
+                # previous zone instead of intersecting with it.
+                n_total += int(np.sum(mask_base[:, :, z] & ~inside))  # voxels dropped
+                mask[:, :, z] = mask_base[:, :, z] & inside
                 for key in [k for k in cache if k[1] == z]:
                     del cache[key]
             else:  # "Flag capillary"
@@ -452,14 +490,17 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                 capillary_mask[:, :, z] |= inside
 
         scope = "all slices" if propagate else f"slice z={int(slice_slider.val)}"
-        verb = "excluded from the mask" if action == "Exclude" else "flagged as capillary"
-        print(f"[Select] {n_total} voxel(s) {verb} ({scope}).")
-        if action == "Exclude":
+        if action == "Fit only":
+            kept = sum(int(mask[:, :, z].sum()) for z in z_list)
+            print(f"[Select] Fit only: {kept} voxel(s) kept, {n_total} other tissue voxel(s) "
+                  f"removed from the mask ({scope}).")
+        else:
+            verb = "excluded from the mask" if action == "Exclude" else "flagged as capillary"
+            print(f"[Select] {n_total} voxel(s) {verb} ({scope}).")
+        if action in ("Exclude", "Fit only"):
             print("         Cached results cleared where affected — recompute maps to see the effect.")
 
-        mode["value"] = None
-        _selector["obj"] = None
-        _reset_buttons()
+        # Select mode stays active here too; click "Select" again (or Reset) to leave it.
         _draw_mask_overlay()
         fig.canvas.draw_idle()
 
@@ -515,6 +556,19 @@ def display_slice(data, te, mask=None, voxel_dims=None):
 
     radio_shape.on_clicked(_on_shape_change)
 
+    def _close_select():
+        """Leave Select mode: drop the selector, hide and disable the panel."""
+        if mode["value"] == "select":
+            mode["value"] = None
+        if _selector["obj"] is not None:
+            _selector["obj"].disconnect_events()
+            _selector["obj"] = None
+        for a in (ax_shape, ax_action, ax_propagate):
+            a.set_visible(False)
+        radio_shape.active = False
+        radio_action.active = False
+        check_propagate.active = False
+
     # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(event):
@@ -534,10 +588,34 @@ def display_slice(data, te, mask=None, voxel_dims=None):
 
     button_reset.on_clicked(reset)
 
+    # ── Restore mask ──────────────────────────────────────────────────────────
+
+    def restore_mask(event):
+        """Back to the automatic mask: undo every Exclude / Fit only, clear the
+        capillary flags and all cached maps (they were computed on the old mask)."""
+        if mask is None:
+            return
+        n_back = int(np.sum(mask_original & ~mask))
+        n_cap = int(capillary_mask.sum())
+        mask[...] = mask_original
+        mask_base[...] = mask_original
+        capillary_mask[...] = False
+        cache.clear()
+        print(f"[Restore] Automatic mask restored on all slices: {n_back} voxel(s) back in the mask, "
+              f"{n_cap} capillary flag(s) cleared, cached maps cleared.")
+        _draw_mask_overlay()
+        fig.canvas.draw_idle()
+
+    button_restore.on_clicked(restore_mask)
+
     # ── Button callbacks ──────────────────────────────────────────────────────
 
     def make_callback(button):
         def toggle_mode(event):
+            # Any other button ends Select mode (it would otherwise stay armed
+            # now that a selection no longer closes it).
+            if mode["value"] == "select" and button is not button_select:
+                _close_select()
             _reset_buttons()
 
             # Keep Fit button highlighted when another button is active
@@ -885,7 +963,18 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                 fig_n, axes = plt.subplots(3, 2, figsize=(10, 12))
                 fig_n.canvas.manager.set_window_title("Noise")
 
-                plot_histogram(data, ax=axes[0, 0])
+                t_cur = int(echo_slider.val)
+                if "bg3d" not in cache_bg:
+                    # Background voxels kept by the sigma-clipping (same population
+                    # as the auto noise estimate): drops the bright halo around the
+                    # tissue, which would otherwise stretch the single-echo histogram.
+                    vol_max = np.max(data, axis=-1)
+                    mu_bg, sd_bg, bg_pre, _ = estimate_noise_auto(vol_max, verbose=False)
+                    cache_bg["bg3d"] = bg_pre & (vol_max > 0) & (np.abs(vol_max - mu_bg) < 3.0 * sd_bg)
+                plot_histogram(
+                    data, ax=axes[0, 0], z=z, t=t_cur,
+                    bg_mask=cache_bg["bg3d"], te_ms=float(te[t_cur]), sigma=sigma_noise,
+                )
 
                 if mask is not None:
                     axes[0, 1].imshow(
@@ -1223,7 +1312,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         ui_axes = [
             button_fit.ax, button_mono_mapping.ax, button_bi_mapping.ax,
             button_utils.ax, button_noise.ax, button_reset.ax,
-            button_select.ax, ax_shape, ax_action, ax_propagate,
+            button_select.ax, button_restore.ax, ax_shape, ax_action, ax_propagate,
             axecho, axslice,
         ]
         if event.inaxes in ui_axes:

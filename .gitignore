@@ -9,6 +9,7 @@
 data/*
 !data/test/
 !data/test/**
+simulated/
 
 # Python - fichiers generes automatiquement
 __pycache__/

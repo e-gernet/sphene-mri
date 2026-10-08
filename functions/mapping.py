@@ -28,46 +28,71 @@ from .utils import compute_aic, compute_r2, compute_rmse, tqdm_joblib
 
 # ── Histogram utility ─────────────────────────────────────────────────────────
 
-def plot_histogram(data, ax=None, bins=100):
-    """Plot the intensity histogram of the background used for noise stats.
+def plot_histogram(data, ax=None, bins=100, z=None, t=None, bg_mask=None, te_ms=None, sigma=None):
+    """Plot the intensity histogram of the background noise.
 
-    Draws the exact background population produced by
-    :func:`functions.utils.estimate_noise_auto` (Otsu segmentation +
-    iterative sigma-clipping) — the same method that drives
-    ``mask_rician``'s tissue mask. This used to plot corner voxels
-    instead, from a separate, older estimation method; that meant the
-    histogram shown here and the tissue mask shown beside it (e.g. in the
-    "Noise" popup) were computed two different ways and could visually
-    disagree even when both were "correct" on their own terms. They now
-    share the same background population.
+    Two modes:
+
+    * **One slice, one echo** (``z`` and ``t`` given): histogram of the
+      background voxels of slice ``z`` at echo ``t`` -- what the image shows
+      for that slice/echo, and what the offset C of the fits is compared to.
+      ``bg_mask`` is the 3-D background mask from
+      :func:`functions.utils.estimate_noise_auto` (computed here if omitted).
+    * **Whole volume** (``z``/``t`` omitted): the background population of the
+      maximum projection over the echoes (Otsu + sigma-clipping), the one
+      that drives ``mask_rician``. Its mean is about 2.2x higher than for a
+      single echo, because the maximum of 32 noise draws is larger than one draw.
 
     Parameters
     ----------
     data : np.ndarray of shape (nx, ny, nz) or (nx, ny, nz, n_te)
-        Raw MRI data. If 4-D, the maximum projection along the echo axis
-        is used.
+        Raw MRI data.
     ax : matplotlib.axes.Axes or None, optional
         Axes to draw on. If ``None``, a new figure is created and displayed.
     bins : int, optional
         Number of histogram bins. Default is 100.
+    z, t : int or None, optional
+        Slice and echo index for the one-slice/one-echo mode.
+    bg_mask : np.ndarray of bool, shape (nx, ny, nz), optional
+        Background mask (one-slice/one-echo mode).
+    te_ms : float or None, optional
+        Echo time shown in the title.
+    sigma : float or None, optional
+        Noise level (see :func:`functions.utils.estimate_sigma`). If given, in the
+        one-slice/one-echo mode a second line marks the expected mean of a
+        pure-noise background, ``sigma * sqrt(pi/2)`` (about 1.25 sigma).
 
     Examples
     --------
-    >>> plot_histogram(data)                     # standalone figure
-    >>> plot_histogram(data, ax=axes[0, 0])      # embed in existing layout
+    >>> plot_histogram(data)                          # whole volume, max projection
+    >>> plot_histogram(data, z=7, t=0)                # slice 7, first echo
     """
     from .utils import estimate_noise_auto
 
-    vol = np.max(data, axis=-1) if data.ndim == 4 else data
-    mean, _std, _background_mask, clipped_values = estimate_noise_auto(vol)
+    if z is not None and t is not None and data.ndim == 4:
+        if bg_mask is None:
+            _, _, bg_mask, _ = estimate_noise_auto(np.max(data, axis=-1), verbose=False)
+        values = data[:, :, z, t][bg_mask[:, :, z]]
+        values = values[values > 0]
+        mean = float(values.mean()) if values.size else float("nan")
+        te_txt = f", TE={te_ms:.1f} ms" if te_ms is not None else ""
+        title = f"Background noise, slice z={z}, echo {t + 1}{te_txt}"
+    else:
+        vol = np.max(data, axis=-1) if data.ndim == 4 else data
+        mean, _std, _background_mask, values = estimate_noise_auto(vol, verbose=False)
+        title = "Background noise histogram (max over echoes, Otsu + sigma-clip)"
 
     standalone = ax is None
     if standalone:
         _fig, ax = plt.subplots()
 
-    ax.hist(clipped_values, bins=bins, density=True, color="steelblue")
+    ax.hist(values, bins=bins, density=True, color="steelblue")
     ax.axvline(mean, linestyle="--", color="cyan", label=f"µ={mean:.1f}")
-    ax.set_title("Background noise histogram (auto, Otsu + sigma-clip)")
+    if sigma is not None and z is not None and t is not None:
+        floor = float(sigma) * np.sqrt(np.pi / 2)
+        ax.axvline(floor, linestyle=":", color="orange", linewidth=2,
+                   label=f"expected noise floor = {floor:.0f}\n(1.25 x sigma, sigma={sigma:.0f})")
+    ax.set_title(title, fontsize=10)
     ax.set_xlabel("Intensity")
     ax.set_ylabel("Density")
     ax.legend()
@@ -424,48 +449,3 @@ def _fit_voxel_mono_cfix(x, y, signal, te, c_fixed):
         # exception types; every caller treats "failed" uniformly (NaN
         # here instead of None, since this feeds a numeric map directly).
         return x, y, np.nan
-
-
-def _fit_global(x, y, signal, te, global_best, k):
-    """Fit a single voxel with the globally selected best model.
-
-    .. deprecated::
-        No longer called anywhere in the codebase — the global-model
-        maps (``i0_global``, ``r2_glob_map``, ``rmse_glob_map`` in
-        ``display.py``) are now built by reusing fitted curves already
-        computed in a first pass (``i0_per_model_map``, ``all_fitted``),
-        rather than re-fitting every voxel a second time. Kept here for
-        reference/history; safe to delete once confirmed unneeded.
-
-    Parameters
-    ----------
-    x, y : int
-        Voxel coordinates.
-    signal : np.ndarray of shape (n_te,)
-        Signal decay curve.
-    te : array-like of shape (n_te,)
-        Echo times in milliseconds.
-    global_best : {"mono", "mono+offset", "bi", "bi+offset"}
-        Name of the model to apply.
-    k : int
-        Number of free parameters (used externally for AIC; not used here).
-
-    Returns
-    -------
-    x, y : int
-        Input coordinates.
-    r2 : float
-        R² of the fit with the global model.
-    rmse : float
-        RMSE of the fit with the global model.
-    """
-    func_map = {
-        "mono":        fit_mono,
-        "mono+offset": fit_mono_offset,
-        "bi":          fit_bi,
-        "bi+offset":   fit_bi_offset,
-    }
-    _, fitted, _ = func_map[global_best](te, signal)
-    r2   = compute_r2(signal, fitted)   if fitted is not None else np.nan
-    rmse = compute_rmse(signal, fitted) if fitted is not None else np.nan
-    return x, y, r2, rmse

@@ -2,9 +2,9 @@
 Utility functions for signal quality metrics, noise estimation, and masking.
 
 This module provides:
-- Goodness-of-fit metrics: AIC, R², RMSE, Pearson r
-- Noise estimation from background corners
-- Brain/tissue mask generation (histogram, Otsu, Rician)
+- Goodness-of-fit metrics: AIC, R², RMSE
+- Automatic background noise estimation (Otsu + sigma-clipping)
+- Tissue mask generation (histogram, Otsu, Rician)
 - joblib/tqdm integration helper
 """
 
@@ -141,107 +141,10 @@ def compute_rmse(signal, fitted):
     return np.sqrt(np.mean((signal - fitted) ** 2))
 
 
-def compute_pearson_r(signal, fitted):
-    """Compute the Pearson correlation coefficient between signal and fit.
-
-    Parameters
-    ----------
-    signal : array-like of shape (n_te,)
-        Observed signal intensities.
-    fitted : array-like of shape (n_te,) or None
-        Model-predicted signal. If ``None``, returns ``np.nan``.
-
-    Returns
-    -------
-    r : float
-        Pearson r in [-1, 1]. Returns ``np.nan`` if either array has zero
-        standard deviation or if ``fitted`` is ``None``.
-
-    Examples
-    --------
-    >>> r = compute_pearson_r(signal, fitted_signal)
-    """
-    if fitted is None:
-        return np.nan
-    signal = np.asarray(signal, dtype=float)
-    fitted = np.asarray(fitted, dtype=float)
-    if np.std(signal) == 0 or np.std(fitted) == 0:
-        return np.nan
-    return np.corrcoef(signal, fitted)[0, 1]
-
-
 # ── Noise estimation ──────────────────────────────────────────────────────────
 
-def _extract_corners(data, corner_fraction=0.05):
-    """Extract voxel intensities from the 8 corners of a 3-D volume.
-
-    Corners are used as background regions to estimate noise statistics,
-    assuming the sample does not occupy the edges of the field of view.
-
-    Parameters
-    ----------
-    data : np.ndarray of shape (nx, ny, nz) or (nx, ny, nz, n_te)
-        Raw MRI data. If 4-D, the maximum projection along the echo axis
-        is used.
-    corner_fraction : float, optional
-        Fraction of each axis used to define corner size. Default is 0.05
-        (5 % of each dimension).
-
-    Returns
-    -------
-    corners : np.ndarray of shape (n_corner_voxels,)
-        Strictly positive intensity values extracted from the 8 corners.
-    """
-    vol = np.max(data, axis=-1) if data.ndim == 4 else data
-    nx, ny, nz = vol.shape
-    cx = max(1, int(nx * corner_fraction))
-    cy = max(1, int(ny * corner_fraction))
-    cz = max(1, int(nz * corner_fraction))
-    corners = np.concatenate([
-        vol[:cx,  :cy,  :cz ].flatten(), vol[-cx:, :cy,  :cz ].flatten(),
-        vol[:cx,  -cy:, :cz ].flatten(), vol[-cx:, -cy:, :cz ].flatten(),
-        vol[:cx,  :cy,  -cz:].flatten(), vol[-cx:, :cy,  -cz:].flatten(),
-        vol[:cx,  -cy:, -cz:].flatten(), vol[-cx:, -cy:, -cz:].flatten(),
-    ])
-    return corners[corners > 0]
-
-
-def estimate_noise(data, corner_fraction=0.05):
-    """Estimate background noise mean and standard deviation from volume corners.
-
-    Parameters
-    ----------
-    data : np.ndarray of shape (nx, ny, nz) or (nx, ny, nz, n_te)
-        Raw MRI data.
-    corner_fraction : float, optional
-        Fraction of each axis used to define corner regions. Default is 0.05.
-
-    Returns
-    -------
-    mean : float
-        Mean intensity in background corners.
-    std : float
-        Standard deviation of intensity in background corners.
-
-    Examples
-    --------
-    >>> mean, std = estimate_noise(data)
-    >>> print(f"SNR estimate: {signal_peak / std:.1f}")
-
-    See Also
-    --------
-    estimate_noise_auto : Corner-free alternative using automatic
-        foreground/background segmentation (recommended — corners can be
-        biased by field-of-view edge artefacts).
-    """
-    corners = _extract_corners(data, corner_fraction)
-    mean, std = np.mean(corners), np.std(corners)
-    print(f"[Noise] Mean: {mean:.4f} | Std: {std:.4f}")
-    return mean, std
-
-
-def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0):
-    """Estimate background noise mean/std without relying on corner regions.
+def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0, verbose=True):
+    """Estimate background noise mean/std from an automatic background segmentation.
 
     Segments background vs. sample automatically with Otsu's threshold on
     the maximum-intensity projection, then refines the background
@@ -276,13 +179,18 @@ def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0):
     sigma_clip : float, optional
         Voxels beyond ``sigma_clip`` standard deviations from the current
         background mean are rejected at each iteration. Default is 3.0.
+    verbose : bool, optional
+        Print one summary line. Default is True. Callers that only need the
+        background mask pass False so the line is not repeated.
 
     Returns
     -------
     mean : float
-        Mean intensity over the clipped background voxels.
+        Mean intensity over the clipped background voxels. On 4-D data this is
+        the mean of the MAXIMUM over the echoes (about 2.2x the background of
+        a single echo), not the noise level: use :func:`estimate_sigma` for that.
     std : float
-        Standard deviation over the clipped background voxels.
+        Standard deviation over the clipped background voxels (same remark).
     background_mask : np.ndarray of shape (nx, ny, nz), dtype bool
         Voxels classified as background *before* clipping (the Otsu
         split), returned so it can be reused (e.g. plotted) without
@@ -291,8 +199,7 @@ def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0):
     clipped_values : np.ndarray, 1-D
         The exact 1-D array of intensities that produced ``mean``/``std``
         (background, Otsu-split, post sigma-clip). Kept so a histogram of
-        "the noise we actually measured" can be drawn without silently
-        falling back to a different (e.g. corner-based) population.
+        "the noise we actually measured" can be drawn.
 
     Examples
     --------
@@ -317,12 +224,61 @@ def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0):
         clipped = kept
 
     mean, std = float(np.mean(clipped)), float(np.std(clipped))
-    print(
-        f"[Noise] (auto, Otsu + {i + 1}-pass sigma-clip) Mean: {mean:.4f} | "
-        f"Std: {std:.4f} | n={clipped.size}/{bg_values.size} background "
-        f"voxels kept"
-    )
+    if verbose:
+        what = "max over echoes" if data.ndim == 4 else "image"
+        print(
+            f"[Noise] Background of the {what} (Otsu + {i + 1}-pass sigma-clip): "
+            f"mean of the max = {mean:.1f} | std = {std:.1f} | "
+            f"n={clipped.size}/{bg_values.size} background voxels kept"
+        )
     return mean, std, background_mask, clipped
+
+
+def estimate_sigma(data, bg_mask=None):
+    """Estimate the Rician noise level σ of the acquisition, per echo then combined.
+
+    ``estimate_noise_auto`` works on the *maximum projection over echoes*,
+    which is the right input for segmenting tissue from background but the
+    wrong one for measuring noise: the maximum of ``n_te`` independent noise
+    samples is systematically larger than a single sample, so the mean/std
+    it returns overestimate σ by a factor ≈ 2 on 32-echo data. Here the
+    background (Otsu split, reused from ``estimate_noise_auto``) is read
+    echo by echo instead.
+
+    For pure Rician noise the median of the magnitude is
+    ``σ·sqrt(2·ln 2)``, so ``σ = median / 1.1774``. The median is used
+    rather than the mean or second moment because it is insensitive to the
+    few tissue-halo / ghosting voxels that survive the Otsu split on the
+    first (brightest) echoes. The per-echo estimates should all agree
+    (noise does not depend on TE); their median is returned.
+
+    Parameters
+    ----------
+    data : np.ndarray of shape (nx, ny, nz, n_te)
+        Raw 4-D MRI data (magnitude).
+    bg_mask : np.ndarray of bool, shape (nx, ny, nz), optional
+        Background mask from :func:`estimate_noise_auto`. Computed (silently)
+        if omitted.
+
+    Returns
+    -------
+    sigma : float
+        Noise standard deviation of the underlying Gaussian channels, in
+        the same units as ``data``.
+
+    Examples
+    --------
+    >>> sigma = estimate_sigma(data)
+    >>> snr_first_echo = np.median(data[mask, 0]) / sigma
+    """
+    if bg_mask is None:
+        _, _, bg_mask, _ = estimate_noise_auto(np.max(data, axis=-1), verbose=False)
+    per_echo = []
+    for t in range(data.shape[-1]):
+        bg = data[..., t][bg_mask]
+        bg = bg[bg > 0]
+        per_echo.append(np.median(bg) / np.sqrt(2 * np.log(2)))
+    return float(np.median(per_echo))
 
 
 # ── Pre-processing filters ────────────────────────────────────────────────────
@@ -521,40 +477,39 @@ def mask_otsu(data, use_morpho=False):
     return mask
 
 
-def mask_rician(data, background="auto", corner_fraction=0.05, k=4.0, use_morpho=False):
-    """Generate a binary mask using a Rician noise threshold.
+def mask_rician(data, k=None, p_false=1e-6, use_morpho=False):
+    """Binary tissue mask: threshold on the max projection, set from the noise level.
 
-    Estimates the Rician noise parameter σ from the background, then
-    thresholds at k·σ_rician. This approach is better suited to magnitude
-    MRI data than Gaussian-based methods.
+    The threshold is ``k * sigma``, with ``sigma`` the noise level of one echo
+    (:func:`estimate_sigma`; for 3-D input, the Rician floor
+    ``mean(background) / sqrt(pi/2)``).
+
+    How ``k`` is chosen (``k=None``): the mask is applied to the MAXIMUM over
+    the ``n`` echoes, so the threshold must clear the largest of ``n`` noise
+    draws. For pure noise (Rayleigh law) one draw exceeds ``T`` with
+    probability ``q = exp(-T^2 / 2 sigma^2)``, and the maximum of ``n`` draws
+    exceeds it with probability ``p = 1 - (1 - q)^n``. Setting ``p`` to
+    ``p_false`` and solving for ``T`` gives ``k = sqrt(-2 ln q)``, with
+    ``q = 1 - (1 - p_false)^(1/n)``. With the default ``p_false = 1e-6`` and 32
+    echoes, ``k`` is about 5.9: on average less than one background voxel per
+    million is wrongly labelled tissue. ``k`` fixes the threshold directly if given.
 
     References
     ----------
     Gudbjartsson, H., & Patz, S. (1995). The Rician distribution of noisy
-    MRI data. *Magnetic Resonance in Medicine*, 34(6), 910–914.
+    MRI data. *Magnetic Resonance in Medicine*, 34(6), 910-914.
 
     Parameters
     ----------
     data : np.ndarray of shape (nx, ny, nz) or (nx, ny, nz, n_te)
         Raw MRI data.
-    background : {"auto", "corners"}, optional
-        How the background used to estimate σ_rician is defined.
-
-        - ``"auto"`` (default, recommended) : automatic Otsu segmentation
-          over the full volume (see :func:`estimate_noise_auto`). Uses far
-          more voxels than the corners and is not biased by field-of-view
-          edge artefacts.
-        - ``"corners"`` : legacy behaviour, background sampled from the 8
-          volume corners only. Kept for backward compatibility and for
-          side-by-side comparison against ``"auto"``.
-    corner_fraction : float, optional
-        Fraction of each axis used to define background corners. Only used
-        when ``background="corners"``. Default 0.05.
-    k : float, optional
-        Threshold multiplier applied to σ_rician. Default is 4.0.
+    k : float or None, optional
+        Threshold in units of sigma. If None (default), derived from ``p_false``.
+    p_false : float, optional
+        Accepted probability that a pure-noise voxel passes the threshold.
+        Default 1e-6.
     use_morpho : bool, optional
         If ``True``, apply binary closing and hole-filling after thresholding.
-        Default is ``False``.
 
     Returns
     -------
@@ -563,25 +518,28 @@ def mask_rician(data, background="auto", corner_fraction=0.05, k=4.0, use_morpho
 
     Examples
     --------
-    >>> mask = mask_rician(data)                          # Otsu background
-    >>> mask_legacy = mask_rician(data, background="corners")  # for comparison
+    >>> mask = mask_rician(data)
     """
     vol = np.max(data, axis=-1) if data.ndim == 4 else data
 
-    if background == "auto":
-        _, _, bg_mask, _ = estimate_noise_auto(vol)
+    _, _, bg_mask, _ = estimate_noise_auto(data)
+    if data.ndim == 4:
+        sigma = estimate_sigma(data, bg_mask=bg_mask)
+        n_te = data.shape[-1]
+    else:
         bg_values = vol[bg_mask]
         bg_values = bg_values[bg_values > 0]
-        sigma_rician = np.mean(bg_values) / np.sqrt(np.pi / 2)
-    elif background == "corners":
-        corners = _extract_corners(vol if vol.ndim == 3 else data, corner_fraction)
-        sigma_rician = np.mean(corners) / np.sqrt(np.pi / 2)
-    else:
-        raise ValueError(
-            f"Unknown background '{background}'. Choose from ['auto', 'corners']."
-        )
+        sigma = np.mean(bg_values) / np.sqrt(np.pi / 2)
+        n_te = 1
 
-    mask = vol > k * sigma_rician
+    if k is None:
+        q = -np.expm1(np.log1p(-p_false) / n_te)   # per-echo exceedance probability
+        k = float(np.sqrt(-2.0 * np.log(q)))
+    threshold = k * sigma
+    print(f"[Mask] threshold = {k:.2f} x sigma = {threshold:.0f}  "
+          f"(sigma = {sigma:.0f}, {n_te} echo(es))")
+
+    mask = vol > threshold
     if use_morpho:
         mask = _apply_morphology(mask)
     return mask
@@ -607,7 +565,7 @@ def compute_mask(data, method="rician", use_morpho=False, **kwargs):
         If ``True``, apply binary closing and hole-filling. Default is ``False``.
     **kwargs
         Additional keyword arguments forwarded to the selected masking function
-        (e.g. ``k=4.0`` for Rician, ``k=3.5`` for histogram).
+        (e.g. ``p_false=1e-6`` or ``k=5.9`` for Rician, ``k=3.5`` for histogram).
 
     Returns
     -------
@@ -621,7 +579,7 @@ def compute_mask(data, method="rician", use_morpho=False, **kwargs):
 
     Examples
     --------
-    >>> mask = compute_mask(data, method="rician", k=4.0, use_morpho=True)
+    >>> mask = compute_mask(data, method="rician", p_false=1e-6, use_morpho=True)
     >>> mask = compute_mask(data, method="otsu")
     """
     methods = {

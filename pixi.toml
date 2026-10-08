@@ -8,6 +8,8 @@ version = "0.1.0"
 [tasks]
 sphene = "python main.py"
 filter-compare = "python main.py --compare-filters"
+validate = "python validation.py"
+simulate = "python make_simulated.py"
 
 [dependencies]
 python = "3.11.*"
