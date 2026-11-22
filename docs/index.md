@@ -14,10 +14,16 @@ végétaux (graines, algues, plantes) par relaxométrie T2.
   temporel (Savitzky-Golay le long de l'axe TE), avec un mode comparaison
   pour évaluer objectivement le gain (R², RMSE)
 - Génération de masques tissulaires (seuillage Rician, Otsu, histogramme)
-- Ajustement de modèles de décroissance T2 : mono-exponentiel, mono-exponentiel
-  avec offset, bi-exponentiel, bi-exponentiel avec offset
-- Sélection de modèle par critère d'information d'Akaike (AIC)
-- Cartographies paramétriques voxel par voxel (T2, I0, fractions, erreurs)
+- Ajustement de modèles de décroissance T2 par maximum de vraisemblance, avec
+  la loi de bruit des images en module (loi de Rice) et le niveau de bruit
+  mesuré dans le fond de l'image : mono-exponentiel et bi-exponentiel, sans
+  paramètre « offset »
+- Choix du modèle par le critère AICc : le bi n'est retenu que là où les
+  données le justifient
+- Cartographies paramétriques voxel par voxel (T2, I0, fractions, χ² réduit,
+  erreurs)
+- Rapport de validation par simulation : graphes, statistiques et explications
+  (voir [Méthode et validation](methode.md))
 - Export des cartes calculées en tableau long (CSV, une ligne par voxel),
   filtré sur le masque tissulaire, avec auto-vérification à l'écriture
 - Visualisation interactive 2D (matplotlib) et 3D (Plotly)
@@ -39,16 +45,20 @@ et [Utilisation de base](tutorials/usage.md) pour un guide pas à pas.
 ```
 sphene-mri/
 ├── main.py                # point d'entrée (flags --device, --compare-filters)
+├── validation.py           # rapport de validation par simulation (pixi run validate)
+├── make_simulated.py        # jeux simulés .nii + .acqp avec vérité connue
 ├── functions/
-│   ├── io.py               # chargement NIfTI / ACQP, dialogues, export CSV
-│   ├── model.py             # modèles de décroissance T2
-│   ├── utils.py              # métriques, bruit, masques, filtrage (CPU/GPU)
-│   ├── filter_compare.py      # comparaison objective des stratégies de filtrage
-│   ├── mapping.py              # calcul voxel-wise parallélisé
-│   └── display.py               # interface interactive
-├── pixi.toml                      # dépendances et environnements (default/dev/gpu)
+│   ├── io.py                 # chargement NIfTI / ACQP, dialogues, export CSV
+│   ├── model.py               # modèles T2 mono/bi, vraisemblance de Rice, choix AICc
+│   ├── utils.py                # métriques, bruit, masques, filtrage (CPU/GPU)
+│   ├── filter_compare.py        # comparaison objective des stratégies de filtrage
+│   ├── mapping.py                # calcul voxel-wise parallélisé
+│   ├── display.py                 # interface interactive
+│   ├── simulation.py               # tirages simulés, limite de Cramér-Rao
+│   └── report.py                    # rapport HTML (texte, figures, contrôles)
+├── pixi.toml                        # dépendances et environnements (default/dev/gpu)
 ├── pixi.lock
-└── docs/                            # cette documentation
+└── docs/                              # cette documentation
 ```
 
 ## Licence et contexte

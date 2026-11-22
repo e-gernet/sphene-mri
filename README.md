@@ -13,13 +13,19 @@ Pipeline d'analyse de relaxométrie T2 pour des données IRM de plantes
   avec un mode de comparaison objective (R², RMSE) et accélération GPU
   facultative pour le filtre spatial
 - Génération de masques tissulaires (Rician, Otsu, histogramme)
-- Ajustement de modèles de décroissance T2 : mono-exponentiel, mono-exponentiel
-  avec offset, bi-exponentiel, bi-exponentiel avec offset
-- Sélection de modèle par critère d'information d'Akaike (AIC)
-- Cartographies paramétriques voxel par voxel (T2, I0, fractions, erreurs)
+- Ajustement de modèles de décroissance T2 par maximum de vraisemblance, avec
+  la loi de bruit des images en module (loi de Rice) et le niveau de bruit
+  mesuré dans le fond de l'image : mono-exponentiel et bi-exponentiel, sans
+  paramètre « offset »
+- Choix du modèle par le critère AICc : le bi n'est retenu que là où les
+  données le justifient
+- Cartographies paramétriques voxel par voxel (T2, I0, fractions, χ² réduit,
+  erreurs)
 - Sélection interactive (lasso / rectangle / cercle) pour exclure des voxels
-  du masque, les flaguer (ex: capillaires), ou lancer un fit moyenné sur une
-  région
+  du masque, les flaguer (ex: capillaires), ou ajuster ensemble tous les voxels
+  d'une région
+- Rapport de validation par simulation (`pixi run validate`) : graphes,
+  statistiques et explications montrant que les T2 sont justes
 - Export des cartes calculées en tableau CSV (une ligne par voxel), filtré
   sur le masque tissulaire, avec coordonnées physiques (mm) et
   auto-vérification à l'écriture
@@ -103,6 +109,14 @@ Comparer les stratégies de filtrage avant de choisir :
 
 ```bash
 pixi run filter-compare
+```
+
+Vérifier le calcul (rapport HTML avec graphes, statistiques et explications) :
+
+```bash
+pixi run validate-quick     # 1 à 2 minutes
+pixi run validate           # version complète (environ 8 minutes), à citer dans un document
+pixi run simulate           # jeux simulés .nii + .acqp avec vérité connue
 ```
 
 ## Documentation

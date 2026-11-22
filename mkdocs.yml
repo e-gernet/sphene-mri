@@ -37,14 +37,23 @@ plugins:
             merge_init_into_class: true
             members_order: source
 
+# Blocs « !!! tip / warning / note » et blocs de code imbriqués (sans cela ils s'affichent en texte brut)
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+
 nav:
   - Accueil: index.md
   - Installation: installation.md
   - Tutoriels:
       - Utilisation de base: tutorials/usage.md
+  - Méthode et validation: methode.md
   - Référence API:
       - io: api/io.md
       - model: api/model.md
       - utils: api/utils.md
       - mapping: api/mapping.md
       - display: api/display.md
+      - simulation: api/simulation.md
+      - report: api/report.md
