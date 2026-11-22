@@ -666,7 +666,8 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                 for key in [k for k in cache if k[1] == z]:
                     del cache[key]
             else:  # "Flag capillary"
-                n_total += int(np.sum(inside & ~capillary_mask[:, :, z]))
+                # Count the tissue voxels only (background pixels in the drawn box are not voxels of the sample).
+                n_total += int(np.sum(inside & mask[:, :, z] & ~capillary_mask[:, :, z]))
                 capillary_mask[:, :, z] |= inside
 
         scope = "all slices" if propagate else f"slice {int(slice_slider.val) + 1}"
@@ -888,6 +889,9 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                     _draw_map(fig_b, ax_b, arr, title, cmap_b, vmin_b, vmax_b, tissue=tissue)
                     stat_entries.append((title.split("\n")[0], arr, 2 if key == "f_bi" else 1))
                 _print_map_stats(stat_entries, f"slice {z + 1}")
+                if s["n_limit_bi"]:
+                    print(f"        {s['n_limit_bi']} voxel(s) shown here have a T2c or T2l on a limit of the "
+                          "search range (value not reliable; flagged in the export).")
                 plt.tight_layout()
                 plt.show()
 
@@ -1102,14 +1106,10 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                     _set_button(button, "lightgray")
                     return
 
-                iso_min = np.percentile(finite_vals, 30)
-                iso_max = np.percentile(finite_vals, 98)
-
                 nx, ny, nz = vol_masked.shape
                 x_idx, y_idx, z_idx = np.meshgrid(
                     np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij"
                 )
-                vol_plot = np.nan_to_num(vol_masked, nan=0.0)
 
                 if voxel_dims is not None:
                     dx, dy, dz = voxel_dims
@@ -1125,20 +1125,47 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                         "zaxis_title": "Z (slice index)",
                     }
 
-                fig_3d = go.Figure(data=go.Volume(
-                    x=x_coords.flatten(),
-                    y=y_coords.flatten(),
-                    z=z_coords.flatten(),
-                    value=vol_plot.flatten(),
-                    isomin=iso_min,
-                    isomax=iso_max,
-                    opacity=0.15,
-                    surface_count=20,
-                    colorscale="Viridis",
-                    caps={"x_show": False, "y_show": False, "z_show": False},
-                ))
+                # Layers: echo 1, then the T2 mono and the T2 of bi (T2 effective, only where bi is
+                # kept) of EVERY slice. Slices already fitted come from the cache, the others are
+                # fitted now (a few minutes the first time). Each layer has its own legend
+                # entry: click its name to hide it, click again to show it.
+                nz_fit = vol.shape[2]
+                print(f"[3D] Fitting mono and bi on every slice ({nz_fit}); slices already fitted are reused...")
+                t2_mono_vol = np.full(vol.shape, np.nan)
+                t2_bi_vol = np.full(vol.shape, np.nan)
+                for zz in range(nz_fit):
+                    res_z = _get_fit(zz, button)
+                    if res_z is None:
+                        continue
+                    t2_mono_vol[:, :, zz] = res_z["maps"]["T2_mono"]
+                    t2_bi_vol[:, :, zz] = res_z["maps"]["T2eff_bi"]
+
+                layers = [("Echo 1 signal", vol_masked, 30, 98, "Viridis"),
+                          ("T2 mono (ms)", t2_mono_vol, 2, 98, "Hot"),
+                          ("T2 bi, effective (ms)", t2_bi_vol, 2, 98, "Blues")]
+                traces = []
+                for k, (name, values, lo, hi, colorscale) in enumerate(layers):
+                    finite = values[np.isfinite(values)]
+                    if finite.size == 0:
+                        continue
+                    traces.append(go.Volume(
+                        x=x_coords.flatten(),
+                        y=y_coords.flatten(),
+                        z=z_coords.flatten(),
+                        value=np.nan_to_num(values, nan=0.0).flatten(),
+                        isomin=np.percentile(finite, lo),
+                        isomax=np.percentile(finite, hi),
+                        opacity=0.15,
+                        surface_count=20,
+                        colorscale=colorscale,
+                        caps={"x_show": False, "y_show": False, "z_show": False},
+                        name=name,
+                        showlegend=True,
+                        colorbar={"title": {"text": name}, "x": 1.0 + 0.12 * k, "len": 0.6},
+                    ))
+                fig_3d = go.Figure(data=traces)
                 fig_3d.update_layout(
-                    title=f"3D view — echo 1 | threshold {iso_min:.0f}–{iso_max:.0f}",
+                    title="3D view — echo 1 signal, T2 mono and T2 bi (click a name in the legend to hide or show it)",
                     scene={**axis_titles, "aspectmode": "data"},
                     margin={"l": 0, "r": 0, "t": 40, "b": 0},
                 )

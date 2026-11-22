@@ -247,8 +247,9 @@ def slice_summary(maps):
     """Counts and medians of a fitted slice, as a dict.
 
     Keys: ``n`` (voxels fitted), ``n_bi``, ``n_mono``, ``share_bi``, ``n_limit``
-    (voxels whose kept model has a T2 on a search limit), ``chi2_median``
-    (median reduced chi-square of the kept model).
+    (voxels whose kept model has a T2 on a search limit), ``n_limit_bi`` (among
+    the voxels where bi is kept, those with T2c or T2l on a search limit),
+    ``chi2_median`` (median reduced chi-square of the kept model).
     """
     fitted = np.isfinite(maps["best"])
     n = int(fitted.sum())
@@ -257,6 +258,7 @@ def slice_summary(maps):
         "n": n, "n_bi": n_bi, "n_mono": n - n_bi,
         "share_bi": n_bi / n if n else float("nan"),
         "n_limit": int(np.nansum(maps["limit_best"])),
+        "n_limit_bi": int(np.nansum(maps["limit_bi"][fitted & (maps["best"] == 1)])),
         "chi2_median": float(np.nanmedian(maps["chi2_best"])) if n else float("nan"),
     }
 
