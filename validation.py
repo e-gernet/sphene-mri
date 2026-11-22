@@ -30,6 +30,7 @@ Usage
     python validation.py --nifti a.nii --acqp a.acqp          # ajoute vos données (section 10)
     python validation.py --acqp a.acqp --t2c 12 --t2l 60 --f 0.5 --snr 30   # section 11
     python validation.py --choose-files                       # fenêtres de choix de fichiers
+    python validation.py --presentation                       # 2 figures anglaises de la présentation (dossier validation_report/presentation/)
 
 Le niveau de bruit et les temps d'écho par défaut sont ceux du grain de blé (sigma = 513,
 32 échos de 2,9172 ms). Avec ``--acqp`` / ``--nifti``, les simulations utilisent VOS temps
@@ -40,6 +41,7 @@ Code de sortie : 0 si aucun contrôle n'échoue, 1 sinon.
 
 import argparse
 import contextlib
+import csv
 import io
 import itertools
 import math
@@ -1392,6 +1394,92 @@ def write_intro_and_summary(rep, ctx, args, elapsed):
              "« apparent » (échos stimulés, séquence).")
 
 
+# ── Figures de présentation (en anglais, un seul graphique chacune) ──────────
+
+PRES_T2, PRES_SNR = 12.0, 30          # tissue of the "noise floor" figure (same as section 1)
+PRES_SNRS = (10, 20, 30, 50, 100, 150)  # SNR axis of the "error" figure (same as the full report)
+
+
+def _plain_ticks(ax, axis, ticks):
+    """Axis ticks written as plain numbers (1, 2, 5, 10...), decimal point, no minor labels."""
+    target = ax.xaxis if axis == "x" else ax.yaxis
+    (ax.set_xticks if axis == "x" else ax.set_yticks)(ticks)
+    target.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    target.set_minor_formatter(NullFormatter())
+
+
+def presentation_figures(te, sigma, seed, n_mono, out_dir):
+    """Write the two single-graph English figures of the presentation; return their numbers.
+
+    ``presentation_noise_floor.png``: true signal, measured average and the noise
+    floor, in multiples of the noise (tissue T2 = 12 ms, SNR 30).
+    ``presentation_error_vs_snr.png``: typical error on T2 for classical least squares
+    and for the Rician maximum likelihood, from the same simulated trials (and the same
+    seeds) as the full report, so the numbers are the ones of table 2.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    te = np.asarray(te, dtype=float)
+
+    # Figure 1: the noise floor
+    t = np.linspace(te[0], 95.0, 400)
+    true = sim.true_curve(t, {"kind": "mono", "T2": PRES_T2, "snr": PRES_SNR}, sigma) / sigma
+    mean = rice_mean(true * sigma, sigma) / sigma
+    floor = math.sqrt(math.pi / 2)
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    ax.semilogy(t, true, "--", color=C_TRUE, lw=1.8)
+    ax.semilogy(t, mean, color=C_SPHENE, lw=2.2)
+    ax.axhline(floor, color=C_LS, ls=":", lw=2.2)
+    ax.set_xlim(0, 95)
+    ax.set_ylim(0.55, 45)
+    _plain_ticks(ax, "y", [1, 2, 5, 10, 20, 40])
+    ax.annotate("True signal\n(no noise)", xy=(PRES_T2 * math.log(PRES_SNR), 1.0), xytext=(21, 0.85),
+                va="center", fontsize=9, fontweight="bold", color=C_TRUE,
+                arrowprops=dict(arrowstyle="->", color=C_TRUE, lw=1))
+    ax.text(93, 2.2, "What we actually\nmeasure (average)", ha="right", va="bottom", fontsize=9,
+            fontweight="bold", color=C_SPHENE)
+    ax.text(93, 0.86, "Noise floor = 1.25 × noise", ha="right", va="center", fontsize=9,
+            fontweight="bold", color=C_LS)
+    ax.set_xlabel("Echo time (ms)")
+    ax.set_ylabel("Signal, in multiples of the noise (log scale)")
+    ax.set_title("Signal stops at the floor")
+    fig.tight_layout()
+    fig.savefig(out_dir / "presentation_noise_floor.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    # Figure 2: typical error on T2 against the SNR (T2 = 12 ms)
+    ctx = SimpleNamespace(cfg={"t2s": (PRES_T2,), "snrs": PRES_SNRS, "n_mono": n_mono}, te=te, sigma=sigma, seed=seed)
+    trials = run_mono_trials(ctx)
+    err_ls = [robust(trials[(PRES_T2, s)]["ls"], PRES_T2)["err"] for s in PRES_SNRS]
+    err_mle = [robust(trials[(PRES_T2, s)]["mono_T2"], PRES_T2)["err"] for s in PRES_SNRS]
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    ax.plot(PRES_SNRS, err_ls, "o-", color=C_LS, lw=2, label="Classical least squares")
+    ax.plot(PRES_SNRS, err_mle, "o-", color=C_SPHENE, lw=2, label="Rician MLE")
+    ax.axhline(0, color="0.3", lw=0.8)
+    ax.set_xscale("log")
+    _plain_ticks(ax, "x", list(PRES_SNRS))
+    ax.set_xlim(8.5, 175)
+    ax.set_ylim(-8, 118)
+    ax.annotate(f"{err_ls[0]:+.0f} %".replace("-", "−"), (PRES_SNRS[0], err_ls[0]), xytext=(8, -4),
+                textcoords="offset points", fontsize=9, fontweight="bold", color=C_LS)
+    ax.annotate(f"{err_mle[0]:+.1f} %".replace("-", "−"), (PRES_SNRS[0], err_mle[0]), xytext=(8, 5),
+                textcoords="offset points", fontsize=9, fontweight="bold", color=C_SPHENE)
+    ax.set_xlabel("Signal-to-noise ratio (SNR)")
+    ax.set_ylabel("Typical error on T2 (%)")
+    ax.set_title(f"True T2 = {PRES_T2:g} ms")
+    ax.legend(loc="upper right", frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_dir / "presentation_error_vs_snr.png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    with open(out_dir / "presentation_numbers.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["snr", "typical_error_least_squares_pct", "typical_error_rician_mle_pct"])
+        for snr, a, b in zip(PRES_SNRS, err_ls, err_mle):
+            w.writerow([snr, f"{a:.2f}", f"{b:.2f}"])
+    return {"snr": list(PRES_SNRS), "err_ls": err_ls, "err_mle": err_mle, "floor": floor}
+
+
 # ── Point d'entrée ───────────────────────────────────────────────────────────
 
 def parse_args(argv=None):
@@ -1407,6 +1495,8 @@ def parse_args(argv=None):
     ap.add_argument("--t2-mono", type=float, help="T2 mono attendu")
     ap.add_argument("--snr", type=float, help="SNR du tissu attendu (signal à TE=0 / bruit)")
     ap.add_argument("--couples", action="store_true", help="section 11 : plusieurs couples T2c/T2l")
+    ap.add_argument("--presentation", action="store_true",
+                    help="écrit seulement les 2 figures anglaises de la présentation (plancher du bruit, erreur selon le SNR)")
     a = ap.parse_args(argv)
     a.mode_name = "quick" if a.quick else "full"
     return a
@@ -1439,6 +1529,15 @@ def main(argv=None):
         nifti_name = Path(args.nifti).name
 
     out_dir = Path(args.out)
+    if args.presentation:
+        t0 = time.time()
+        # always the full number of draws (300): a figure that is quoted must not depend on --quick
+        res = presentation_figures(te, sigma, args.seed, MODES["full"]["n_mono"], out_dir / "presentation")
+        print(f"Figures de présentation écrites dans {(out_dir / 'presentation').resolve()} ({time.time() - t0:.0f} s)")
+        print(f"  T2 vrai {PRES_T2:g} ms, SNR {res['snr'][0]} : erreur typique {res['err_ls'][0]:+.1f} % "
+              f"(moindres carrés) contre {res['err_mle'][0]:+.1f} % (maximum de vraisemblance de Rice)")
+        print(f"  plancher du bruit : {res['floor']:.4f} x sigma")
+        return 0
     rep = Report(out_dir, "Sphene-MRI : rapport de validation",
                  "Les calculs de T2 retrouvent-ils la vérité ? (simulations, graphes, statistiques)")
     ctx = SimpleNamespace(cfg=cfg, te=te, sigma=sigma, seed=args.seed, R={}, mono=None, bi=None, heat=None)

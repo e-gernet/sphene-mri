@@ -10,6 +10,7 @@ sphene = "python main.py"
 filter-compare = "python main.py --compare-filters"
 validate = "python validation.py"
 validate-quick = "python validation.py --quick"
+presentation = "python validation.py --presentation"
 simulate = "python make_simulated.py"
 stats = "python quickstats.py"
 
