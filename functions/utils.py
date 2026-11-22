@@ -2,8 +2,10 @@
 Utility functions for signal quality metrics, noise estimation, and masking.
 
 This module provides:
-- Goodness-of-fit metrics: AIC, R², RMSE
-- Automatic background noise estimation (Otsu + sigma-clipping)
+- Goodness-of-fit metrics: R², RMSE
+- Automatic background noise estimation (Otsu + sigma-clipping), the noise level
+  sigma used by the fits, and a check that the background really is Rician noise
+- Pre-processing filters
 - Tissue mask generation (histogram, Otsu, Rician)
 - joblib/tqdm integration helper
 """
@@ -51,42 +53,6 @@ def tqdm_joblib(tqdm_object):
 
 
 # ── Goodness-of-fit metrics ───────────────────────────────────────────────────
-
-def compute_aic(signal, fit, k):
-    """Compute the Akaike Information Criterion (AIC) for a fitted signal.
-
-    Uses the small-sample corrected form when ``n / k < 40``.
-    A lower AIC indicates a better trade-off between fit quality and model
-    complexity.
-
-    Parameters
-    ----------
-    signal : array-like of shape (n_te,)
-        Observed signal intensities.
-    fit : array-like of shape (n_te,) or None
-        Model-predicted signal. If ``None``, returns ``np.inf``.
-    k : int
-        Number of free parameters in the model
-        (e.g. 2 for mono, 3 for mono+offset, 4 for bi, 5 for bi+offset).
-
-    Returns
-    -------
-    aic : float
-        AIC value. Returns ``np.inf`` if ``fit`` is ``None``.
-
-    Examples
-    --------
-    >>> aic = compute_aic(signal, fitted_signal, k=2)
-    """
-    if fit is None:
-        return np.inf
-    n = len(signal)
-    residuals = signal - fit
-    rss = np.sum(residuals ** 2)
-    if rss <= 0:
-        rss = 1e-10
-    return 2 * k + n * np.log(rss / n)
-
 
 def compute_r2(signal, fitted):
     """Compute the coefficient of determination R².
@@ -234,8 +200,8 @@ def estimate_noise_auto(data, n_iter=10, sigma_clip=3.0, verbose=True):
     return mean, std, background_mask, clipped
 
 
-def estimate_sigma(data, bg_mask=None):
-    """Estimate the Rician noise level σ of the acquisition, per echo then combined.
+def sigma_per_echo(data, bg_mask=None):
+    """Noise level σ measured on each echo separately, in the background.
 
     ``estimate_noise_auto`` works on the *maximum projection over echoes*,
     which is the right input for segmenting tissue from background but the
@@ -249,8 +215,7 @@ def estimate_sigma(data, bg_mask=None):
     ``σ·sqrt(2·ln 2)``, so ``σ = median / 1.1774``. The median is used
     rather than the mean or second moment because it is insensitive to the
     few tissue-halo / ghosting voxels that survive the Otsu split on the
-    first (brightest) echoes. The per-echo estimates should all agree
-    (noise does not depend on TE); their median is returned.
+    first (brightest) echoes.
 
     Parameters
     ----------
@@ -262,14 +227,9 @@ def estimate_sigma(data, bg_mask=None):
 
     Returns
     -------
-    sigma : float
-        Noise standard deviation of the underlying Gaussian channels, in
-        the same units as ``data``.
-
-    Examples
-    --------
-    >>> sigma = estimate_sigma(data)
-    >>> snr_first_echo = np.median(data[mask, 0]) / sigma
+    sigma : np.ndarray of shape (n_te,)
+        One estimate per echo, in the same units as ``data``. They should all
+        agree: the noise does not depend on the echo time.
     """
     if bg_mask is None:
         _, _, bg_mask, _ = estimate_noise_auto(np.max(data, axis=-1), verbose=False)
@@ -278,7 +238,75 @@ def estimate_sigma(data, bg_mask=None):
         bg = data[..., t][bg_mask]
         bg = bg[bg > 0]
         per_echo.append(np.median(bg) / np.sqrt(2 * np.log(2)))
-    return float(np.median(per_echo))
+    return np.array(per_echo)
+
+
+def estimate_sigma(data, bg_mask=None):
+    """Noise level σ of the acquisition: median of :func:`sigma_per_echo`.
+
+    σ is the standard deviation of the Gaussian noise on each of the two
+    channels (real and imaginary) before the magnitude is taken, in the units of
+    ``data``. This is the value the fits need.
+
+    Examples
+    --------
+    >>> sigma = estimate_sigma(data)
+    >>> snr_first_echo = np.median(data[mask, 0]) / sigma
+    """
+    return float(np.median(sigma_per_echo(data, bg_mask)))
+
+
+def check_rice_noise(data, bg_mask=None, verbose=True, tolerance=0.05):
+    """Check that the image background behaves like pure Rician noise.
+
+    The fits assume that, where there is no signal, the measured values follow
+    the Rayleigh law with a single level σ. That law has a fingerprint: for any
+    fraction ``p`` of the background values, the value below which they lie,
+    ``q_p``, gives the same σ through ``σ_p = q_p / sqrt(-2 ln(1 - p))``. Here
+    this is computed for p = 10, 25, 50 and 75 % of the background of all
+    echoes. If the four σ_p agree, the background is Rayleigh. If they drift
+    apart, the data were probably smoothed, reconstructed from several coils or
+    contain structure in the background, and the noise model is then wrong.
+
+    Parameters
+    ----------
+    data : np.ndarray of shape (nx, ny, nz, n_te)
+        Raw 4-D MRI data (magnitude).
+    bg_mask : np.ndarray of bool, optional
+        Background mask from :func:`estimate_noise_auto` (computed if omitted).
+    verbose : bool, optional
+        Print one summary line. Default True.
+    tolerance : float, optional
+        Largest accepted relative difference between the four σ_p (default 5 %).
+
+    Returns
+    -------
+    out : dict
+        ``sigma_p`` (the four values), ``spread`` (largest minus smallest,
+        divided by their median), ``sigma_echo_spread`` (same for the per-echo
+        σ of :func:`sigma_per_echo`) and ``ok`` (both below ``tolerance``).
+    """
+    if bg_mask is None:
+        _, _, bg_mask, _ = estimate_noise_auto(np.max(data, axis=-1), verbose=False)
+    values = data[bg_mask]                       # (n_background_voxels, n_te)
+    values = values[values > 0]
+    probs = np.array([0.10, 0.25, 0.50, 0.75])
+    sigma_p = np.quantile(values, probs) / np.sqrt(-2.0 * np.log(1.0 - probs))
+    spread = float((sigma_p.max() - sigma_p.min()) / np.median(sigma_p))
+    per_echo = sigma_per_echo(data, bg_mask)
+    echo_spread = float((per_echo.max() - per_echo.min()) / np.median(per_echo))
+    ok = spread < tolerance and echo_spread < tolerance
+    if verbose:
+        print("[Noise] Rayleigh check of the background: sigma from the 10/25/50/75 % points = "
+              + " / ".join(f"{s:.0f}" for s in sigma_p)
+              + f" (spread {100 * spread:.1f} %); sigma echo to echo: spread {100 * echo_spread:.1f} %.")
+        if ok:
+            print("        -> the background behaves like pure Rician noise: the noise model holds.")
+        else:
+            print(f"        -> WARNING: spread above {100 * tolerance:.0f} %. The background does not look like "
+                  "pure Rician noise (smoothed or filtered data? several receiver coils?). The fits "
+                  "assume it is: check before trusting the T2 values.")
+    return {"sigma_p": sigma_p, "spread": spread, "sigma_echo_spread": echo_spread, "ok": ok}
 
 
 # ── Pre-processing filters ────────────────────────────────────────────────────

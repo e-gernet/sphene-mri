@@ -9,16 +9,22 @@ given slice for each filtering strategy.
 
 import numpy as np
 
-from .utils import filter_data, compute_mask
-from .mapping import run_parallel, _fit_voxel_error
+from .mapping import fit_slice
+from .utils import compute_mask, estimate_sigma, filter_data
 
 
 def compare_filters(data, te, z, methods=("none", "gaussian_spatial", "savgol_temporal"), device="cpu"):
     """Compare filtering strategies on a single slice.
 
-    For each method, filters the volume, recomputes the tissue mask,
-    fits the AIC-selected best model on every masked voxel, and reports
-    the mean R² and RMSE.
+    For each method, filters the volume, fits mono and bi on every voxel of the
+    reference mask (keeping the model the data justify, see
+    :func:`functions.model.fit_both`) and reports the mean R² and RMSE. The noise
+    level given to the fits is measured on the filtered data themselves.
+
+    Caution: R² and RMSE are computed against the filtered data, which are less
+    noisy by construction, so a better score after filtering does not prove
+    that the T2 values are better; the fits also assume the noise of raw
+    magnitude images (Rician), which no filter preserves.
 
     Parameters
     ----------
@@ -48,7 +54,7 @@ def compare_filters(data, te, z, methods=("none", "gaussian_spatial", "savgol_te
     ...     print(method, stats)
     """
     results = {}
-    print(f"\n[Filter comparison] slice z={z}")
+    print(f"\n[Filter comparison] slice {z + 1}")
     print("─" * 58)
 
     # Fixed mask computed once on the raw (unfiltered) data, so every
@@ -69,12 +75,10 @@ def compare_filters(data, te, z, methods=("none", "gaussian_spatial", "savgol_te
     for method in methods:
         data_f = filter_data(data, method=method, sigma=1.0, window=5, poly=2, device=device)
 
-        out = run_parallel(_fit_voxel_error, voxels, data_f, te, z)
-        r2_vals = [row[3] for row in out]
-        rmse_vals = [row[4] for row in out]
+        maps, _ = fit_slice(data_f, te, z, voxels, estimate_sigma(data_f))
 
-        r2_mean = float(np.nanmean(r2_vals))
-        rmse_mean = float(np.nanmean(rmse_vals))
+        r2_mean = float(np.nanmean(maps["r2_best"]))
+        rmse_mean = float(np.nanmean(maps["rmse_best"]))
         results[method] = {
             "n_voxels": len(voxels),
             "R2_mean": r2_mean,

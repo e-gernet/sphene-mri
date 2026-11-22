@@ -3,28 +3,31 @@ Interactive matplotlib-based viewer for MRI T2 relaxometry data.
 
 This module provides a single entry point :func:`display_slice` that opens
 a matplotlib figure with slice/echo navigation sliders and a set of analysis
-buttons. All heavy computation is cached per slice so repeated button clicks
-are instantaneous.
+buttons. Every analysis button reads the same per-slice result (the mono and bi
+models fitted on all the voxels of the slice, see
+:func:`functions.mapping.fit_slice`), computed once and then cached, so the
+other buttons and repeated clicks are instantaneous.
 
 Buttons
 -------
 Fit
-    Click any voxel to fit all four models and plot decay curves with AIC
-    scores. The best model (lowest AIC) is drawn thicker with a star label.
+    Click any voxel to fit the mono and bi models by maximum likelihood and plot
+    the decay curves. The model the data justify (lowest AICc, see
+    :func:`functions.model.fit_both`) is drawn thicker with a star.
 Mono Map
-    Compute T2 maps from mono-exponential fits (standard, with offset,
-    and with a globally fixed offset C) for the current slice.
+    T2 map of the mono-exponential fit for the current slice.
 Bi Map
-    Compute T2 maps from bi-exponential fits (short T2c, long T2l, effective
-    T2) for the current slice.
+    T2c, T2l, water fraction f and effective T2 of the bi-exponential fit, shown
+    only in the voxels where the data justify two components.
 Utils
-    AIC-based model selection map, water fraction maps, I0 maps, and a
-    smoothed reference image.
+    Model kept in each voxel, evidence for bi (delta AICc), water fraction, I0
+    maps and a smoothed reference image.
 Error
-    R² and RMSE maps (voxel-wise best model and globally-selected model).
+    Reduced chi-square, RMSE and R² maps: how well the kept model (and one single
+    model for the whole slice) explains the data.
 Noise
-    Offset C maps from models with additive offset, plus the background
-    noise histogram and the tissue mask overlay.
+    Background histogram against the Rayleigh law of pure noise, tissue mask,
+    noise level echo by echo and mean residual of each echo.
 3D View
     Interactive volumetric rendering of the first echo using Plotly.
 """
@@ -37,35 +40,27 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
-from matplotlib.colors import ListedColormap
+from matplotlib.colors import ListedColormap, TwoSlopeNorm
 from matplotlib.path import Path as MplPath
 from matplotlib.widgets import Button, LassoSelector, Slider
 from scipy.ndimage import gaussian_filter
 
 from .io import export_rois, export_table
-from .mapping import (
-    _fit_voxel_bi,
-    _fit_voxel_error,
-    _fit_voxel_mono,
-    _fit_voxel_mono_cfix,
-    _fit_voxel_noise,
-    _fit_voxel_utils,
-    plot_histogram,
-    run_parallel,
-)
-from .model import fit_bi, fit_bi_offset, fit_mono, fit_mono_offset
-from .utils import compute_aic, compute_r2, compute_rmse, estimate_noise_auto, estimate_sigma
+from .mapping import fit_slice, map_stats, plot_histogram, slice_summary, stats_header, stats_line
+from .model import DELTA_AICC, MODELS, fit_both, fit_quality
+from .utils import check_rice_noise, estimate_noise_auto, sigma_per_echo
 
-# Discrete colour palette for AIC model-selection maps (4 models)
-_AIC_COLORS = ["#4C72B0", "#55A868", "#C44E52", "#8172B2"]
-_AIC_LABELS = ["mono", "mono+offset", "bi", "bi+offset"]
+# One colour per model, in the order of ``MODELS`` (maps and decay-curve plots)
+_MODEL_COLORS = {"mono": "#4C72B0", "bi": "#C44E52"}
 
-# Colour cycle for the per-voxel fit plot (one colour per model)
-_FIT_COLORS = {
-    "mono":        "#4C72B0",
-    "mono+offset": "#55A868",
-    "bi":          "#C44E52",
-    "bi+offset":   "#8172B2",
+# Map of the per-slice fit  ->  column name in the exported CSV
+_EXPORT_COLUMNS = {
+    "T2_mono": "T2_mono",
+    "T2c_bi": "T2c_bi", "T2l_bi": "T2l_bi", "f_bi": "f_bi", "T2eff_bi": "T2eff_bi",
+    "best": "bi_kept",             # 1 = the data justify bi, 0 = mono
+    "delta_aicc": "delta_AICc",    # evidence for bi
+    "I0_best": "I0", "chi2_best": "chi2_red", "r2_best": "R2", "rmse_best": "RMSE",
+    "limit_best": "T2_at_limit",   # 1 = a T2 ended on a limit of the search range
 }
 
 
@@ -96,12 +91,85 @@ def _use_array_coords(ax, arr):
     ax.format_coord = format_coord
 
 
+def _percentile_range(arr, low=2, high=98):
+    """Colour range covering the central part of the finite values of ``arr``.
+
+    A few extreme voxels (for instance a T2 on a limit of the search range) would
+    otherwise stretch the colour scale and flatten everything else.
+    Returns ``(None, None)`` if ``arr`` holds no finite value.
+    """
+    vals = arr[np.isfinite(arr)]
+    if vals.size == 0:
+        return None, None
+    return float(np.percentile(vals, low)), float(np.percentile(vals, high))
+
+
+def _draw_map(fig, ax, arr, title, cmap, vmin=None, vmax=None, norm=None, tissue=None):
+    """Show a 2-D map with its colour bar and the array-index coordinate readout.
+
+    ``tissue`` (bool array) draws in light grey the tissue voxels that have no
+    value on the map (e.g. the bi map where mono is kept), to tell them apart
+    from the background.
+    """
+    if tissue is not None:
+        ax.imshow(np.where(tissue, 1.0, np.nan), cmap="Greys", vmin=0, vmax=3,
+                  origin="upper", interpolation="nearest")
+    im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax, norm=norm,
+                   origin="upper", interpolation="nearest")
+    ax.set_title(title)
+    ax.axis("off")
+    fig.colorbar(im, ax=ax, fraction=0.046)
+    _use_array_coords(ax, arr)
+    return im
+
+
+def _draw_distribution(ax, arr, title, xlabel):
+    """Histogram of the finite values of ``arr`` with their mean.
+
+    The horizontal range leaves out the 0.5 % most extreme values on each side,
+    so a handful of outliers does not squeeze the histogram; the mean is computed
+    on all the values.
+    """
+    vals = arr[np.isfinite(arr)]
+    if vals.size:
+        low, high = np.percentile(vals, [0.5, 99.5])
+        mu = float(np.mean(vals))
+        ax.hist(vals, bins=60, range=(low, high), color="steelblue", density=True)
+        ax.axvline(mu, linestyle="--", color="cyan", label=f"µ={mu:.1f}")
+        ax.legend()
+    ax.set_title(f"Distribution — {title}")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Density")
+
+
+def _print_map_stats(entries, where):
+    """Print n, mean, SD, median, min and max of maps in the console.
+
+    ``entries`` is a list of ``(label, array, decimals)``; ``where`` says what
+    the values come from ("slice 8", "zone of 64 voxel(s), ..."). Same layout
+    as ``quickstats.py``.
+    """
+    width = max(len(label) for label, _, _ in entries) + 2
+    print(f"[Stats] {where}")
+    print(stats_header("map", width))
+    for label, arr, decimals in entries:
+        print(stats_line(label, map_stats(arr), decimals, width))
+
+
+def _count_from_one(slider):
+    """Show the value of an index slider counted from 1 (the stored value stays 0-based)."""
+    def refresh(val):
+        slider.valtext.set_text(str(int(val) + 1))
+    slider.on_changed(refresh)
+    refresh(slider.val)
+
+
 def display_slice(data, te, mask=None, voxel_dims=None):
     """Launch the interactive T2 relaxometry viewer.
 
     Opens a matplotlib figure showing the MRI volume with slice and echo
-    navigation sliders. Seven analysis buttons trigger per-slice computations
-    that are cached after the first run.
+    navigation sliders. The analysis buttons all read one per-slice fit (mono and
+    bi on every voxel), computed at the first click and cached afterwards.
 
     Parameters
     ----------
@@ -135,7 +203,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
     # Separate from `mask`: flagged voxels stay IN the tissue mask (still
     # fitted/exported) but are tagged, e.g. capillary vs sample.
     capillary_mask = np.zeros_like(mask, dtype=bool) if mask is not None else None
-    # Every "Average + Fit" region drawn in this session: voxel coordinates + fit
+    # Every "Zone fit" region drawn in this session: voxel coordinates + fit
     # results, written next to the map CSV by the Export button.
     roi_list = []
     # Tissue mask WITHOUT any "Fit only" restriction. "Exclude" edits both it and
@@ -158,6 +226,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         ax=axecho, label="Echo (ms)",
         valstep=1, valmin=0, valmax=data.shape[3] - 1, valinit=t,
     )
+    _count_from_one(echo_slider)
 
     axslice = fig.add_axes([0.155, 0.25, 0.0225, 0.63])
     slice_slider = Slider(
@@ -165,19 +234,23 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         valstep=1, valmin=0, valmax=data.shape[2] - 1, valinit=z,
         orientation="vertical",
     )
+    _count_from_one(slice_slider)
 
     # ── SNR readout (console) ───────────────────────────────────────────────
     # σ is measured once for the whole acquisition, then SNR is reported
     # per slice over the tissue mask whenever the slice changes.
-    sigma_noise = estimate_sigma(data)
+    _, _, bg_otsu, _ = estimate_noise_auto(np.max(data, axis=-1), verbose=False)
+    sigma_echo = sigma_per_echo(data, bg_otsu)      # one estimate per echo
+    sigma_noise = float(np.median(sigma_echo))      # the value the fits use
+    check_rice_noise(data, bg_otsu)                 # is the background really Rician?
     last_snr_slice = {"z": None}
 
     def _print_snr(z):
         if mask is None or not mask[:, :, z].any():
-            print(f"[SNR] slice z={z}: no tissue voxel in the mask.")
+            print(f"[SNR] slice {z + 1}: no tissue voxel in the mask.")
             return
         snr = np.median(data[:, :, z, 0][mask[:, :, z]]) / sigma_noise
-        print(f"[SNR] slice z={z} : SNR = {snr:.1f}  "
+        print(f"[SNR] slice {z + 1} : SNR = {snr:.1f}  "
               f"(median tissue signal at echo 1 / background noise)")
 
     _print_snr(z)
@@ -261,7 +334,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
     ax_action = fig.add_axes([0.01, 0.603, 0.13, 0.18])
     ax_action.set_title("Action", fontsize=8)
     radio_action = RadioButtons(
-        ax_action, ("Average + Fit", "Exclude", "Fit only", "Flag capillary", "Show signal"),
+        ax_action, ("Zone fit", "Exclude", "Fit only", "Flag capillary", "Show signal"),
     )
     for lbl in radio_action.labels:
         lbl.set_fontsize(7)
@@ -342,86 +415,103 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         rows, cols = np.mgrid[0:nx, 0:ny]
         return np.column_stack((cols.ravel(), rows.ravel())), (nx, ny)
 
-    # ── Shared 4-model fit + AIC comparison + decay-curve plot ──────────────
-    # Used by both the single-voxel click ("Fit" mode) and the ROI-averaged
-    # fit ("Average + Fit" selection action), so the two stay consistent.
+    # ── Fit of the whole slice (mono + bi on every voxel), done once ─────────
+    # Every map button reads this same result: the first click computes it,
+    # the next ones (any button) use the cache.
+
+    def _get_fit(z, button):
+        """Per-slice fit result ``{"maps", "resid", "elapsed"}`` (cached), or None
+        if the slice has no voxel in the mask."""
+        key = ("fit", z)
+        if key in cache:
+            print(f"[Cache] Fit slice {z + 1}")
+            return cache[key]
+        voxels = _get_voxels(mask, z)
+        if not voxels:
+            print(f"[Fit] Slice {z + 1}: no voxel in the mask, nothing to fit.")
+            _set_button(button, "lightgray")
+            return None
+        _set_button(button, "#ff8c00")
+        t_start = time.time()
+        maps, resid = fit_slice(data, te, z, voxels, sigma_noise)
+        result = {"maps": maps, "resid": resid, "elapsed": time.time() - t_start}
+        cache[key] = result
+
+        s = slice_summary(maps)
+        print(f"[Fit] Slice {z + 1}: {s['n']} voxel(s) fitted in {result['elapsed']:.1f} s | "
+              f"mono kept in {s['n_mono']}, bi kept in {s['n_bi']} ({100 * s['share_bi']:.1f} %) | "
+              f"median chi2_red = {s['chi2_median']:.2f}")
+        if s["n_limit"]:
+            print(f"        {s['n_limit']} voxel(s) have a T2 on a limit of the search range "
+                  "(value not reliable; flagged in the export).")
+        return result
+
+    # ── Mono + bi fit of one curve or one zone, comparison and decay-curve plot ──
+    # Used by both the single-voxel click ("Fit" mode) and the zone fit
+    # ("Zone fit" selection action), so the two stay consistent.
 
     def _fit_and_plot(signal, title, header_lines=()):
-        p_mono,  f_mono,  _ = fit_mono(te, signal)
-        p_off,   f_off,   _ = fit_mono_offset(te, signal)
-        p_bi,    f_bi,    _ = fit_bi(te, signal)
-        p_bioff, f_bioff, _ = fit_bi_offset(te, signal)
+        """Fit mono and bi on a curve (1-D) or on a zone of voxels (2-D, fitted
+        jointly, see :mod:`functions.model`), print the comparison and plot the
+        decay curves.
 
-        aic_mono  = compute_aic(signal, f_mono,  2)
-        aic_off   = compute_aic(signal, f_off,   3)
-        aic_bi    = compute_aic(signal, f_bi,    4)
-        aic_bioff = compute_aic(signal, f_bioff, 5)
+        Returns the :func:`functions.model.fit_both` result and the reduced
+        chi-square of each model."""
+        curves = np.atleast_2d(signal)
+        fit = fit_both(te, signal, sigma_noise)
+        if fit["mono"] is None and fit["bi"] is None:
+            print("[Fit] No fit possible on this signal (empty or invalid).")
+            return fit, {}
+        chi2 = {m: fit_quality(fit[m], signal, sigma_noise) for m in MODELS if fit[m] is not None}
+        best = fit["best"]
 
-        r2_mono  = compute_r2(signal, f_mono)
-        r2_off   = compute_r2(signal, f_off)
-        r2_bi    = compute_r2(signal, f_bi)
-        r2_bioff = compute_r2(signal, f_bioff)
-
-        rmse_mono  = compute_rmse(signal, f_mono)
-        rmse_off   = compute_rmse(signal, f_off)
-        rmse_bi    = compute_rmse(signal, f_bi)
-        rmse_bioff = compute_rmse(signal, f_bioff)
-
-        aic_dict = {
-            "mono": aic_mono, "mono+offset": aic_off,
-            "bi": aic_bi,     "bi+offset":   aic_bioff,
-        }
-        best_model = min(aic_dict, key=aic_dict.get)
-
-        sep = "─" * 58
+        sep = "─" * 70
         print(f"\n{sep}")
         for line in header_lines:
             print(f"  {line}")
         print(sep)
-        print(f"  {'Model':<18} {'I0':>8} {'T2':>7} {'AIC':>8} {'R²':>6} {'RMSE':>8}")
+        print(f"  {'Model':<8} {'I0':>9} {'T2 (ms)':>14} {'f':>6} {'AICc':>9} {'chi2_red':>9}")
         print(sep)
-
-        def _row(name, params, aic, r2, rmse, extra=""):
-            if params is None:
-                return f"  {name:<18} {'—':>8} {'—':>7} {'—':>8} {'—':>6} {'—':>8}"
-            I0 = params.get("I0", float("nan"))
-            T2 = params.get("T2", params.get("T2c", float("nan")))
-            star = " ★" if name == best_model else ""
-            return (
-                f"  {name:<18} {I0:>8.1f} {T2:>7.2f} {aic:>8.1f} "
-                f"{r2:>6.3f} {rmse:>8.1f}{extra}{star}"
-            )
-
-        print(_row("mono",        p_mono,  aic_mono,  r2_mono,  rmse_mono))
-        print(_row("mono+offset", p_off,   aic_off,   r2_off,   rmse_off,
-                   f"  C={p_off['C']:.1f}" if p_off else ""))
-        print(_row("bi", p_bi, aic_bi, r2_bi, rmse_bi,
-                   f"  f={p_bi['f']:.2f} T2l={p_bi['T2l']:.1f}" if p_bi else ""))
-        print(_row("bi+offset", p_bioff, aic_bioff, r2_bioff, rmse_bioff,
-                   (f"  f={p_bioff['f']:.2f} T2l={p_bioff['T2l']:.1f}"
-                    f" C={p_bioff['C']:.1f}") if p_bioff else ""))
-        print(sep)
-        print(f"  Best model (AIC): {best_model}")
-        print(sep)
-
-        fig2, ax2 = plt.subplots(figsize=(7, 4))
-        ax2.plot(te, signal, "o", color="black", label="data", zorder=5)
-
-        model_fits = [
-            ("mono",        f_mono,  aic_mono),
-            ("mono+offset", f_off,   aic_off),
-            ("bi",          f_bi,    aic_bi),
-            ("bi+offset",   f_bioff, aic_bioff),
-        ]
-        for name, fitted, aic in model_fits:
-            if fitted is None:
+        for name in MODELS:
+            res = fit[name]
+            if res is None:
                 continue
-            is_best  = (name == best_model)
-            lw       = 2.5 if is_best else 1.2
-            label    = f"★ {name} (AIC={aic:.1f})" if is_best else f"{name} (AIC={aic:.1f})"
-            ax2.plot(te, fitted, color=_FIT_COLORS[name],
-                     linewidth=lw, label=label, zorder=4 if is_best else 3)
+            p = res["params"]
+            t2_txt = f"{p['T2']:.2f}" if name == "mono" else f"{p['T2c']:.1f} / {p['T2l']:.1f}"
+            f_txt = f"{p['f']:.2f}" if name == "bi" else "—"
+            star = " ★" if name == best else ""
+            warn = "   T2 on a search limit: not reliable" if res["at_bound"] else ""
+            print(f"  {name:<8} {p['I0']:>9.1f} {t2_txt:>14} {f_txt:>6} "
+                  f"{res['aicc']:>9.1f} {chi2[name]:>9.2f}{star}{warn}")
+        print(sep)
+        d_aicc = fit["delta_aicc"]
+        if np.isfinite(d_aicc):
+            print(f"  dAICc = AICc(mono) - AICc(bi) = {d_aicc:.1f}  (bi needs > {DELTA_AICC:g})"
+                  f"  ->  {best} kept")
+        print(sep)
 
+        fig2, ax2 = plt.subplots(figsize=(7.5, 4.5))
+        mean = curves.mean(axis=0)
+        if curves.shape[0] > 1:
+            ax2.errorbar(te, mean, yerr=curves.std(axis=0), fmt="o", color="black", markersize=3.5,
+                         capsize=2, elinewidth=0.8, zorder=5,
+                         label=f"data: mean ± sd of {curves.shape[0]} voxels")
+        else:
+            ax2.plot(te, mean, "o", color="black", label="data", zorder=5)
+        floor = sigma_noise * np.sqrt(np.pi / 2)
+        ax2.axhline(floor, color="darkorange", linestyle=":", linewidth=1.2,
+                    label=f"noise floor ({floor:.0f})")
+        for name in MODELS:
+            res = fit[name]
+            if res is None:
+                continue
+            is_best = name == best
+            ax2.plot(te, res["expected"], color=_MODEL_COLORS[name],
+                     linewidth=2.5 if is_best else 1.2, zorder=4 if is_best else 3,
+                     label=f"{'★ ' if is_best else ''}{name}  (AICc={res['aicc']:.1f}, chi2={chi2[name]:.2f})")
+            if is_best:
+                ax2.plot(te, res["fitted"], "--", color=_MODEL_COLORS[name], linewidth=1.0,
+                         label=f"{name} without noise (the decay that was fitted)")
         ax2.set_xlabel("Echo time (ms)")
         ax2.set_ylabel("Signal intensity")
         ax2.set_title(title)
@@ -431,10 +521,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         fig2.show()
         plt.pause(0.001)
 
-        return best_model, {
-            "mono": p_mono, "mono+offset": p_off,
-            "bi": p_bi, "bi+offset": p_bioff,
-        }
+        return fit, chi2
 
     # ── Raw signal of a zone (no fit) ────────────────────────────────────────
 
@@ -481,15 +568,32 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         print(f"[Signal] {n_vox} voxel(s), {scope}: mean at echo 1 = {mean[0]:.0f}, "
               f"at last echo = {mean[-1]:.0f} (noise floor {floor:.0f}).")
 
+    def _zone_t2_mono(coords):
+        """T2 mono of every voxel of a zone, as an array (NaN where a fit failed).
+
+        ``coords`` is a list of ``(z, x, y)``. Same fit as the Mono Map: read from
+        the cached fit of the slice when there is one, otherwise computed on the
+        voxels of the zone only (and not stored, the cache holds whole slices).
+        """
+        t2 = []
+        for z in sorted({c[0] for c in coords}):
+            pts = [(x, y) for cz, x, y in coords if cz == z]
+            if ("fit", z) in cache:
+                maps = cache[("fit", z)]["maps"]
+            else:
+                maps, _ = fit_slice(data, te, z, pts, sigma_noise)
+            t2.extend(maps["T2_mono"][x, y] for x, y in pts)
+        return np.array(t2)
+
     def _apply_selection(inside):
-        """Apply the current action (exclude/fit only/flag/average+fit) over `inside`
+        """Apply the current action (exclude/fit only/flag/zone fit) over `inside`
         (nx, ny bool mask, array convention), on the current slice or all
         slices."""
         action = radio_action.value_selected
         propagate = check_propagate.get_status()[0]
         z_list = range(mask.shape[2]) if propagate else [int(slice_slider.val)]
 
-        if action in ("Average + Fit", "Show signal"):
+        if action in ("Zone fit", "Show signal"):
             voxel_signals = []
             roi_coords = []  # (slice, x, y) of every voxel entering the average
             for z in z_list:
@@ -507,23 +611,34 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                       "the drawn region — nothing to do.")
                 return
 
-            scope = "all slices" if propagate else f"slice z={int(slice_slider.val)}"
+            scope = "all slices" if propagate else f"slice {int(slice_slider.val) + 1}"
             if action == "Show signal":
                 _show_signal(np.array(voxel_signals), scope)
+                _print_map_stats([("T2 mono (ms)", _zone_t2_mono(roi_coords), 1)],
+                                 f"zone of {len(voxel_signals)} voxel(s), {scope}, T2 of each voxel")
                 return
 
-            mean_signal = np.mean(voxel_signals, axis=0)
             roi_id = len(roi_list) + 1
-            best_model, params = _fit_and_plot(
-                mean_signal,
-                title=f"ROI #{roi_id} averaged fit — n={len(voxel_signals)} voxel(s), {scope}",
+            n_vox = len(voxel_signals)
+            fit, chi2 = _fit_and_plot(
+                np.array(voxel_signals),
+                title=f"ROI #{roi_id} — joint fit of {n_vox} voxel(s), {scope}",
                 header_lines=[
-                    f"ROI #{roi_id} average | n={len(voxel_signals)} voxel(s) | {scope}",
+                    f"ROI #{roi_id} | {n_vox} voxel(s) fitted jointly, curves not averaged "
+                    f"before the fit | {scope}",
                 ],
             )
+            if not chi2:
+                return
+            if fit["best"] == "bi" and n_vox > 1:
+                print("  Note: bi kept on a zone of several voxels can also come from a mixture of "
+                      "different voxels (a zone that is not homogeneous), not only from two "
+                      "components inside each voxel. 'Show signal' on smaller zones helps to tell.")
+            _print_map_stats([("T2 mono (ms)", _zone_t2_mono(roi_coords), 1)],
+                             f"ROI #{roi_id}, {n_vox} voxel(s), {scope}, T2 of each voxel")
             roi_list.append({
                 "id": roi_id, "scope": scope, "coords": roi_coords,
-                "best_model": best_model, "params": params,
+                "fit": fit, "chi2": chi2,
             })
             arr = np.array(roi_coords)
             print(f"  ROI #{roi_id} kept in memory: x {arr[:, 1].min()}–{arr[:, 1].max()}, "
@@ -554,7 +669,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                 n_total += int(np.sum(inside & ~capillary_mask[:, :, z]))
                 capillary_mask[:, :, z] |= inside
 
-        scope = "all slices" if propagate else f"slice z={int(slice_slider.val)}"
+        scope = "all slices" if propagate else f"slice {int(slice_slider.val) + 1}"
         if action == "Fit only":
             kept = sum(int(mask[:, :, z].sum()) for z in z_list)
             print(f"[Select] Fit only: {kept} voxel(s) kept, {n_total} other tissue voxel(s) "
@@ -727,76 +842,18 @@ def display_slice(data, te, mask=None, voxel_dims=None):
             if button is button_mono_mapping:
                 mode["value"] = None
                 z = int(slice_slider.val)
-                cache_key = ("mono", z)
-
-                if cache_key in cache:
-                    t2_mono, t2_off, t2_cfix, c_fixed, t_elapsed = cache[cache_key]
-                    print(f"[Cache] Mono z={z}")
-                else:
-                    _set_button(button, "#ff8c00")
-                    voxels = _get_voxels(mask, z)
-                    nx, ny = data.shape[0], data.shape[1]
-                    t2_mono = np.full((nx, ny), np.nan)
-                    t2_off  = np.full((nx, ny), np.nan)
-                    t2_cfix = np.full((nx, ny), np.nan)
-
-                    t_start = time.time()
-
-                    results = run_parallel(_fit_voxel_mono, voxels, data, te, z)
-                    for x, y, v_mono, v_off in results:
-                        t2_mono[x, y] = v_mono
-                        t2_off[x, y]  = v_off
-
-                    c_vals = []
-                    results_c = run_parallel(_fit_voxel_noise, voxels, data, te, z)
-                    for x, y, c_mono, _ in results_c:
-                        if np.isfinite(c_mono):
-                            c_vals.append(c_mono)
-                    c_fixed = float(np.median(c_vals)) if c_vals else 0.0
-                    print(f"Fixed C estimate: {c_fixed:.1f}")
-
-                    results_cf = run_parallel(
-                        _fit_voxel_mono_cfix, voxels, data, te, z, c_fixed=c_fixed
-                    )
-                    for x, y, v_cfix in results_cf:
-                        t2_cfix[x, y] = v_cfix
-
-                    t_elapsed = time.time() - t_start
-                    print(f"Mono mapping done in {t_elapsed:.1f} s")
-                    cache[cache_key] = (t2_mono, t2_off, t2_cfix, c_fixed, t_elapsed)
-
+                res = _get_fit(z, button)
+                if res is None:
+                    return
                 _set_button(button, "#7bff23")
-                fig_m, axes = plt.subplots(3, 2, figsize=(10, 12))
+
+                arr = res["maps"]["T2_mono"]
+                fig_m, (ax_map, ax_dist) = plt.subplots(1, 2, figsize=(11, 4.8))
                 fig_m.canvas.manager.set_window_title("Mono Mapping")
-
-                for row, arr, title in [
-                    (0, t2_mono, "T2 mono (ms)"),
-                    (1, t2_off,  "T2 mono+offset (ms)"),
-                    (2, t2_cfix, f"T2 mono+offset fixed C={c_fixed:.1f} (ms)"),
-                ]:
-                    finite_vals = arr[np.isfinite(arr)]
-                    vmin = np.percentile(finite_vals, 2)  if len(finite_vals) > 0 else None
-                    vmax = np.percentile(finite_vals, 98) if len(finite_vals) > 0 else None
-
-                    im = axes[row, 0].imshow(
-                        arr, cmap="hot", origin="upper",
-                        interpolation="nearest", vmin=vmin, vmax=vmax,
-                    )
-                    axes[row, 0].set_title(title)
-                    axes[row, 0].axis("off")
-                    fig_m.colorbar(im, ax=axes[row, 0], fraction=0.046)
-                    _use_array_coords(axes[row, 0], arr)
-
-                    if len(finite_vals) > 0:
-                        mu = np.mean(finite_vals)
-                        axes[row, 1].hist(finite_vals, bins=60, color="steelblue", density=True)
-                        axes[row, 1].axvline(mu, linestyle="--", color="cyan",
-                                             label=f"µ={mu:.1f} ms")
-                        axes[row, 1].legend()
-                    axes[row, 1].set_title(f"Distribution — {title}")
-                    axes[row, 1].set_xlabel("T2 (ms)")
-                    axes[row, 1].set_ylabel("Density")
-
+                fig_m.suptitle(f"Mono mapping — slice {z + 1}", fontsize=12)
+                _draw_map(fig_m, ax_map, arr, "T2 mono (ms)", "hot", *_percentile_range(arr))
+                _draw_distribution(ax_dist, arr, "T2 mono (ms)", "T2 (ms)")
+                _print_map_stats([("T2 mono (ms)", arr, 1)], f"slice {z + 1}")
                 plt.tight_layout()
                 plt.show()
 
@@ -804,67 +861,33 @@ def display_slice(data, te, mask=None, voxel_dims=None):
             elif button is button_bi_mapping:
                 mode["value"] = None
                 z = int(slice_slider.val)
-                cache_key = ("bi", z)
-
-                if cache_key in cache:
-                    t2c_bi, t2l_bi, t2c_bioff, t2l_bioff, t2_eff_bi, t2_eff_bioff, t_elapsed = cache[cache_key]
-                    print(f"[Cache] Bi z={z}")
-                else:
-                    _set_button(button, "#ff8c00")
-                    voxels = _get_voxels(mask, z)
-                    nx, ny = data.shape[0], data.shape[1]
-                    t2c_bi       = np.full((nx, ny), np.nan)
-                    t2l_bi       = np.full((nx, ny), np.nan)
-                    t2c_bioff    = np.full((nx, ny), np.nan)
-                    t2l_bioff    = np.full((nx, ny), np.nan)
-                    t2_eff_bi    = np.full((nx, ny), np.nan)
-                    t2_eff_bioff = np.full((nx, ny), np.nan)
-
-                    t_start = time.time()
-                    results = run_parallel(_fit_voxel_bi, voxels, data, te, z)
-                    for x, y, v_t2c, v_t2l, v_t2c_off, v_t2l_off, v_eff_bi, v_eff_bioff in results:
-                        t2c_bi[x, y]       = v_t2c
-                        t2l_bi[x, y]       = v_t2l
-                        t2c_bioff[x, y]    = v_t2c_off
-                        t2l_bioff[x, y]    = v_t2l_off
-                        t2_eff_bi[x, y]    = v_eff_bi
-                        t2_eff_bioff[x, y] = v_eff_bioff
-
-                    t_elapsed = time.time() - t_start
-                    print(f"Bi mapping done in {t_elapsed:.1f} s")
-                    cache[cache_key] = (
-                        t2c_bi, t2l_bi, t2c_bioff, t2l_bioff,
-                        t2_eff_bi, t2_eff_bioff, t_elapsed,
-                    )
-
+                res = _get_fit(z, button)
+                if res is None:
+                    return
                 _set_button(button, "#7bff23")
-                fig_b, axes = plt.subplots(3, 2, figsize=(10, 12))
+
+                maps = res["maps"]
+                s = slice_summary(maps)
+                fig_b, axes = plt.subplots(2, 2, figsize=(10, 8.5))
                 fig_b.canvas.manager.set_window_title("Bi Mapping")
-
-                for ax_b, arr, title in [
-                    (axes[0, 0], t2c_bi,       "T2c bi (ms)"),
-                    (axes[0, 1], t2l_bi,        "T2l bi (ms)"),
-                    (axes[1, 0], t2c_bioff,     "T2c bi+offset (ms)"),
-                    (axes[1, 1], t2l_bioff,     "T2l bi+offset (ms)"),
-                    (axes[2, 0], t2_eff_bi,     "T2 effective bi (ms)"),
-                    (axes[2, 1], t2_eff_bioff,  "T2 effective bi+offset (ms)"),
+                fig_b.suptitle(
+                    f"Bi mapping — slice {z + 1} | two components kept in {s['n_bi']} of {s['n']} voxels "
+                    f"({100 * s['share_bi']:.1f} %), shown in colour; light grey = mono kept",
+                    fontsize=11,
+                )
+                tissue = np.isfinite(maps["best"])
+                stat_entries = []
+                for ax_b, key, title, cmap_b, fixed_range in [
+                    (axes[0, 0], "T2c_bi",   "T2c bi — short component (ms)", "hot", None),
+                    (axes[0, 1], "T2l_bi",   "T2l bi — long component (ms)",  "hot", None),
+                    (axes[1, 0], "f_bi",     "Water fraction f (bi)\nrestricted vs free", "RdBu_r", (0, 1)),
+                    (axes[1, 1], "T2eff_bi", "T2 effective bi: f·T2c + (1-f)·T2l (ms)", "hot", None),
                 ]:
-                    finite_vals = arr[np.isfinite(arr)]
-                    if len(finite_vals) > 0:
-                        vmin = np.percentile(finite_vals, 2)
-                        vmax = 100.0 if "T2l" in title else np.percentile(finite_vals, 98)
-                    else:
-                        vmin, vmax = None, None
-
-                    im = ax_b.imshow(
-                        arr, cmap="hot", origin="upper",
-                        interpolation="nearest", vmin=vmin, vmax=vmax,
-                    )
-                    ax_b.set_title(title)
-                    ax_b.axis("off")
-                    fig_b.colorbar(im, ax=ax_b, fraction=0.046)
-                    _use_array_coords(ax_b, arr)
-
+                    arr = maps[key]
+                    vmin_b, vmax_b = fixed_range if fixed_range else _percentile_range(arr)
+                    _draw_map(fig_b, ax_b, arr, title, cmap_b, vmin_b, vmax_b, tissue=tissue)
+                    stat_entries.append((title.split("\n")[0], arr, 2 if key == "f_bi" else 1))
+                _print_map_stats(stat_entries, f"slice {z + 1}")
                 plt.tight_layout()
                 plt.show()
 
@@ -872,76 +895,37 @@ def display_slice(data, te, mask=None, voxel_dims=None):
             elif button is button_utils:
                 mode["value"] = None
                 z = int(slice_slider.val)
-                cache_key = ("utils", z)
-
-                if cache_key in cache:
-                    (aic_map, i0_voxelwise, i0_global, r2_map, rmse_map,
-                     f_bi_map, f_bioff_map, t2_eff_map,
-                     global_best, model_counts, t_elapsed) = cache[cache_key]
-                    print(f"[Cache] Utils z={z}")
-                else:
-                    _set_button(button, "#ff8c00")
-                    voxels = _get_voxels(mask, z)
-                    nx, ny = data.shape[0], data.shape[1]
-                    model_labels = ["mono", "mono+offset", "bi", "bi+offset"]
-                    model_counts     = {k: 0 for k in model_labels}
-                    aic_map          = np.full((nx, ny), np.nan)
-                    i0_voxelwise     = np.full((nx, ny), np.nan)
-                    r2_map           = np.full((nx, ny), np.nan)
-                    rmse_map         = np.full((nx, ny), np.nan)
-                    f_bi_map         = np.full((nx, ny), np.nan)
-                    f_bioff_map      = np.full((nx, ny), np.nan)
-                    t2_eff_map       = np.full((nx, ny), np.nan)
-                    i0_per_model_map = {k: np.full((nx, ny), np.nan) for k in model_labels}
-
-                    t_start = time.time()
-                    results = run_parallel(_fit_voxel_utils, voxels, data, te, z)
-                    for (x, y, best_idx, best, i0_vw, r2, rmse,
-                         i0_per_model, f_bi_val, f_bioff_val, t2_eff, _) in results:
-                        aic_map[x, y]      = best_idx
-                        i0_voxelwise[x, y] = i0_vw
-                        r2_map[x, y]       = r2
-                        rmse_map[x, y]     = rmse
-                        f_bi_map[x, y]     = f_bi_val
-                        f_bioff_map[x, y]  = f_bioff_val
-                        t2_eff_map[x, y]   = t2_eff
-                        model_counts[best] += 1
-                        for k in model_labels:
-                            i0_per_model_map[k][x, y] = i0_per_model[k]
-
-                    global_best = max(model_counts, key=model_counts.get)
-                    i0_global   = i0_per_model_map[global_best]
-
-                    t_elapsed = time.time() - t_start
-                    print(f"Utils done in {t_elapsed:.1f} s | global: {global_best}")
-                    print(f"Model counts: {model_counts}")
-                    cache[cache_key] = (
-                        aic_map, i0_voxelwise, i0_global, r2_map, rmse_map,
-                        f_bi_map, f_bioff_map, t2_eff_map,
-                        global_best, model_counts, t_elapsed,
-                    )
-
+                res = _get_fit(z, button)
+                if res is None:
+                    return
                 _set_button(button, "#7bff23")
+
+                maps = res["maps"]
+                s = slice_summary(maps)
+                global_best = "bi" if s["n_bi"] > s["n_mono"] else "mono"
+                tissue = np.isfinite(maps["best"])
+
                 fig_u, axes = plt.subplots(3, 2, figsize=(10, 12))
                 fig_u.suptitle(
-                    f"Utils — z={z} | {global_best} | {t_elapsed:.1f} s", fontsize=13
+                    f"Utils — slice {z + 1} | {global_best} for most voxels | {res['elapsed']:.1f} s",
+                    fontsize=13,
                 )
                 fig_u.canvas.manager.set_window_title("Utils")
 
-                cmap_aic = ListedColormap(_AIC_COLORS)
+                # Model kept in each voxel: 0 = mono, 1 = bi
                 axes[0, 0].imshow(
-                    aic_map, cmap=cmap_aic, vmin=-0.5, vmax=3.5,
-                    origin="upper", interpolation="nearest",
+                    maps["best"], cmap=ListedColormap([_MODEL_COLORS[m] for m in MODELS]),
+                    vmin=-0.5, vmax=1.5, origin="upper", interpolation="nearest",
                 )
-                axes[0, 0].set_title("Best model (AIC)")
+                axes[0, 0].set_title("Model kept (AICc)")
                 axes[0, 0].axis("off")
-                _use_array_coords(axes[0, 0], aic_map)
+                _use_array_coords(axes[0, 0], maps["best"])
                 patches = [
-                    mpatches.Patch(color=_AIC_COLORS[i], label=_AIC_LABELS[i])
-                    for i in range(4)
+                    mpatches.Patch(color=_MODEL_COLORS[m], label=f"{m}: {s['n_' + m]} voxels")
+                    for m in MODELS
                 ]
-                axes[0, 0].legend(handles=patches, loc="lower right",
-                                  fontsize=7, framealpha=0.7)
+                axes[0, 0].legend(handles=patches, loc="upper center", bbox_to_anchor=(0.5, 0.0),
+                                  ncol=2, fontsize=7, frameon=False)
 
                 vol_slice  = data[:, :, z, 0].astype(float)
                 vol_masked = (
@@ -953,47 +937,20 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                     np.where(mask[:, :, z], vol_smooth, np.nan)
                     if mask is not None else vol_smooth
                 )
-                im_s = axes[0, 1].imshow(
-                    vol_smooth, cmap="viridis", origin="upper", interpolation="nearest"
-                )
-                axes[0, 1].set_title("Smoothed image (σ=1.5, echo 0)")
-                axes[0, 1].axis("off")
-                fig_u.colorbar(im_s, ax=axes[0, 1], fraction=0.046)
-                _use_array_coords(axes[0, 1], vol_smooth)
+                _draw_map(fig_u, axes[0, 1], vol_smooth, "Smoothed image (σ=1.5, echo 1)", "viridis")
 
-                for ax_u, arr, title in [
-                    (axes[1, 0], f_bi_map,    "Water fraction f (bi)\nrestricted vs free"),
-                    (axes[1, 1], f_bioff_map, "Water fraction f (bi+offset)\nrestricted vs free"),
-                ]:
-                    im_f = ax_u.imshow(
-                        arr, cmap="RdBu_r", vmin=0, vmax=1,
-                        origin="upper", interpolation="nearest",
-                    )
-                    ax_u.set_title(title)
-                    ax_u.axis("off")
-                    fig_u.colorbar(im_f, ax=ax_u, fraction=0.046)
-                    _use_array_coords(ax_u, arr)
+                _draw_map(fig_u, axes[1, 0], maps["f_bi"],
+                          "Water fraction f (bi, where kept)\nrestricted vs free",
+                          "RdBu_r", 0, 1, tissue=tissue)
+                # Evidence for bi: white at the decision threshold, red = bi justified
+                _draw_map(fig_u, axes[1, 1], np.clip(maps["delta_aicc"], -10, 20),
+                          f"Evidence for bi: dAICc = AICc(mono) - AICc(bi)\n(red above {DELTA_AICC:g}: bi kept)",
+                          "RdBu_r", norm=TwoSlopeNorm(vmin=-10, vcenter=DELTA_AICC, vmax=20))
 
-                finite_i0 = i0_voxelwise[np.isfinite(i0_voxelwise)]
-                vmin_i0 = np.percentile(finite_i0, 1)  if len(finite_i0) > 0 else None
-                vmax_i0 = np.percentile(finite_i0, 99) if len(finite_i0) > 0 else None
-                im_i0v = axes[2, 0].imshow(
-                    i0_voxelwise, cmap="viridis",
-                    vmin=vmin_i0, vmax=vmax_i0,
-                    origin="upper", interpolation="nearest",
-                )
-                axes[2, 0].set_title("I0 voxel-wise")
-                axes[2, 0].axis("off")
-                fig_u.colorbar(im_i0v, ax=axes[2, 0], fraction=0.046)
-                _use_array_coords(axes[2, 0], i0_voxelwise)
-
-                im_i0g = axes[2, 1].imshow(
-                    i0_global, cmap="viridis", origin="upper", interpolation="nearest"
-                )
-                axes[2, 1].set_title(f"I0 global ({global_best})")
-                axes[2, 1].axis("off")
-                fig_u.colorbar(im_i0g, ax=axes[2, 1], fraction=0.046)
-                _use_array_coords(axes[2, 1], i0_global)
+                _draw_map(fig_u, axes[2, 0], maps["I0_best"], "I0 voxel-wise (kept model)",
+                          "viridis", *_percentile_range(maps["I0_best"], 1, 99))
+                _draw_map(fig_u, axes[2, 1], maps[f"I0_{global_best}"], f"I0 global ({global_best})",
+                          "viridis", *_percentile_range(maps[f"I0_{global_best}"], 1, 99))
 
                 plt.tight_layout()
                 plt.show()
@@ -1002,30 +959,12 @@ def display_slice(data, te, mask=None, voxel_dims=None):
             elif button is button_noise:
                 mode["value"] = None
                 z = int(slice_slider.val)
-                cache_key = ("noise", z)
-
-                if cache_key in cache:
-                    c_mono_off, c_bi_off, t_elapsed = cache[cache_key]
-                    print(f"[Cache] Noise z={z}")
-                else:
-                    _set_button(button, "#ff8c00")
-                    voxels = _get_voxels(mask, z)
-                    nx, ny = data.shape[0], data.shape[1]
-                    c_mono_off = np.full((nx, ny), np.nan)
-                    c_bi_off   = np.full((nx, ny), np.nan)
-
-                    t_start = time.time()
-                    results = run_parallel(_fit_voxel_noise, voxels, data, te, z)
-                    for x, y, c_mono, c_bi in results:
-                        c_mono_off[x, y] = c_mono
-                        c_bi_off[x, y]   = c_bi
-                    t_elapsed = time.time() - t_start
-                    print(f"Noise maps done in {t_elapsed:.1f} s")
-                    cache[cache_key] = (c_mono_off, c_bi_off, t_elapsed)
-
+                res = _get_fit(z, button)
+                if res is None:
+                    return
                 _set_button(button, "#7bff23")
 
-                fig_n, axes = plt.subplots(3, 2, figsize=(10, 12))
+                fig_n, axes = plt.subplots(2, 2, figsize=(11, 8.5))
                 fig_n.canvas.manager.set_window_title("Noise")
 
                 t_cur = int(echo_slider.val)
@@ -1047,48 +986,48 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                         origin="upper", interpolation="nearest",
                     )
                     _use_array_coords(axes[0, 1], mask[:, :, z])
-                axes[0, 1].set_title(f"Tissue mask — z={z}")
+                axes[0, 1].set_title(f"Tissue mask — slice {z + 1}")
                 axes[0, 1].axis("off")
 
-                for row, arr, title in [
-                    (1, c_mono_off, "Offset C map (mono+offset)"),
-                    (2, c_bi_off,   "Offset C map (bi+offset)"),
-                ]:
-                    im_c = axes[row, 0].imshow(
-                        arr, cmap="plasma", origin="upper", interpolation="nearest"
-                    )
-                    axes[row, 0].set_title(title)
-                    axes[row, 0].axis("off")
-                    fig_n.colorbar(im_c, ax=axes[row, 0], fraction=0.046)
-                    _use_array_coords(axes[row, 0], arr)
+                # Noise level measured on each echo: should be the same everywhere
+                axes[1, 0].plot(te, sigma_echo, "o-", color="steelblue", markersize=3.5)
+                axes[1, 0].axhline(sigma_noise, color="darkorange", linestyle="--",
+                                   label=f"sigma used = {sigma_noise:.0f} (median)")
+                axes[1, 0].set_title("Noise level sigma measured in the background, echo by echo")
+                axes[1, 0].set_xlabel("Echo time (ms)")
+                axes[1, 0].set_ylabel("sigma")
+                axes[1, 0].legend(fontsize=8)
 
-                    c_vals_all = arr[np.isfinite(arr)]
-                    # curve_fit rarely returns an exact 0.0 when hitting the
-                    # lower bound (C >= 0) — it converges to a tiny residual
-                    # instead (e.g. 1e-4). A strict "!= 0" filter misses
-                    # these boundary solutions, so use a small threshold.
-                    c_floor = 1.0  # ms/intensity units — well below any real offset
-                    c_vals = c_vals_all[c_vals_all > c_floor]
-                    n_excluded = len(c_vals_all) - len(c_vals)
-
-                    if len(c_vals) > 0:
-                        mu_c = np.mean(c_vals)
-                        axes[row, 1].hist(c_vals, bins=50, color="steelblue", density=True)
-                        axes[row, 1].axvline(mu_c, linestyle="--", color="cyan",
-                                             label=f"µ={mu_c:.1f}")
-                        axes[row, 1].legend()
-
-                        if n_excluded > 0 and len(c_vals_all) > 0:
-                            mu_with_zeros = np.mean(c_vals_all)
-                            pct = 100 * n_excluded / len(c_vals_all)
-                            print(
-                                f"[Noise] {title}: {n_excluded}/{len(c_vals_all)} "
-                                f"({pct:.1f}%) voxel(s) at the C>=0 lower bound "
-                                f"excluded — mean {mu_with_zeros:.2f} → {mu_c:.2f}"
-                            )
-                    axes[row, 1].set_title(f"Distribution — {title}")
-                    axes[row, 1].set_xlabel("C")
-                    axes[row, 1].set_ylabel("Density")
+                # Mean residual of each echo over the tissue voxels of the slice: a model
+                # that explains the data leaves 0 at every echo.
+                resid = res["resid"]
+                n_ok = np.sum(np.isfinite(resid), axis=0)
+                mean_r = np.nanmean(resid, axis=0)
+                sem_r = np.nanstd(resid, axis=0) / np.sqrt(np.maximum(n_ok, 1))
+                axes[1, 1].axhline(0, color="black", linewidth=0.8)
+                axes[1, 1].errorbar(te, mean_r, yerr=2 * sem_r, fmt="o-", color="firebrick",
+                                    markersize=3.5, capsize=2, elinewidth=0.8)
+                axes[1, 1].set_title("Mean residual of each echo (kept model, tissue voxels)\n"
+                                     "0 = the model explains this echo; bars = ±2 standard errors")
+                axes[1, 1].set_xlabel("Echo time (ms)")
+                axes[1, 1].set_ylabel("measured - expected, in noise units")
+                # First three echoes: residual in noise units, and as a share of the signal
+                # (residual x sigma / tissue signal), the scale used by the validation report.
+                n_first = min(3, len(te))
+                first = mean_r[:n_first]
+                tissue_z = mask[:, :, z] if mask is not None else np.ones(data.shape[:2], dtype=bool)
+                sig_first = np.array([np.median(data[:, :, z, i][tissue_z]) for i in range(n_first)])
+                shift_pc = 100 * first * sigma_noise / sig_first
+                rest = mean_r[n_first:]
+                print("[Noise] Mean residual of the first echoes: "
+                      + ", ".join(f"{v:+.2f}" for v in first) + " noise units, about "
+                      + ", ".join(f"{v:+.1f} %" for v in shift_pc) + " of the signal (0 = model right)."
+                      + (f" Other echoes: from {np.nanmin(rest):+.2f} to {np.nanmax(rest):+.2f}." if rest.size else ""))
+                if np.any(np.abs(shift_pc) >= 5):
+                    n_off = max(i + 1 for i, v in enumerate(shift_pc) if abs(v) >= 3)
+                    print("        A first-echo shift of 5 % or more can bias T2 a little (more on a large zone): see SKIP_FIRST_ECHOES. "
+                          f"If you use it, skip every shifted echo (here at least {n_off}), never fewer: skipping only one echo when the "
+                          "next one is also shifted is worse than skipping none (section 7 of the validation report).")
 
                 plt.tight_layout()
                 plt.show()
@@ -1097,77 +1036,39 @@ def display_slice(data, te, mask=None, voxel_dims=None):
             elif button is button_error:
                 mode["value"] = None
                 z = int(slice_slider.val)
-                cache_key = ("error", z)
-
-                if cache_key in cache:
-                    (r2_map, rmse_map, r2_glob_map, rmse_glob_map,
-                     global_best, t_elapsed) = cache[cache_key]
-                    print(f"[Cache] Error z={z}")
-                else:
-                    _set_button(button, "#ff8c00")
-                    voxels = _get_voxels(mask, z)
-                    nx, ny = data.shape[0], data.shape[1]
-                    r2_map        = np.full((nx, ny), np.nan)
-                    rmse_map      = np.full((nx, ny), np.nan)
-                    r2_glob_map   = np.full((nx, ny), np.nan)
-                    rmse_glob_map = np.full((nx, ny), np.nan)
-                    all_fitted    = {}
-                    counts        = {"mono": 0, "mono+offset": 0, "bi": 0, "bi+offset": 0}
-
-                    t_start = time.time()
-                    results = run_parallel(_fit_voxel_error, voxels, data, te, z)
-                    for x, y, best, r2_vw, rmse_vw, fitted_map in results:
-                        r2_map[x, y]   = r2_vw
-                        rmse_map[x, y] = rmse_vw
-                        counts[best]  += 1
-                        all_fitted[(x, y)] = fitted_map
-
-                    global_best = max(counts, key=counts.get)
-                    print(f"Global model: {global_best} | Counts: {counts}")
-
-                    for x, y in voxels:
-                        f = all_fitted[(x, y)][global_best]
-                        signal = data[x, y, z, :]
-                        r2_glob_map[x, y]   = compute_r2(signal, f)   if f is not None else np.nan
-                        rmse_glob_map[x, y] = compute_rmse(signal, f) if f is not None else np.nan
-
-                    t_elapsed = time.time() - t_start
-                    print(f"Error done in {t_elapsed:.1f} s")
-                    cache[cache_key] = (
-                        r2_map, rmse_map, r2_glob_map, rmse_glob_map, global_best, t_elapsed
-                    )
-
+                res = _get_fit(z, button)
+                if res is None:
+                    return
                 _set_button(button, "#7bff23")
-                fig_e, axes = plt.subplots(2, 3, figsize=(14, 8))
+
+                maps = res["maps"]
+                s = slice_summary(maps)
+                global_best = "bi" if s["n_bi"] > s["n_mono"] else "mono"
+
+                fig_e, axes = plt.subplots(3, 3, figsize=(14, 11))
                 fig_e.suptitle(
-                    f"Error — z={z} | global={global_best} | {t_elapsed:.1f} s", fontsize=13
+                    f"Error — slice {z + 1} | global={global_best} | {res['elapsed']:.1f} s", fontsize=13
                 )
                 fig_e.canvas.manager.set_window_title("Error")
 
-                for row, (arr_vw, arr_glob, label, cmap_e, vmin_e, vmax_e) in enumerate([
-                    (rmse_map, rmse_glob_map, "RMSE", "hot_r",  None, None),
-                    (r2_map,   r2_glob_map,   "R²",  "RdYlGn", 0,    1   ),
+                # chi2_red is about 1 where the model explains the data down to the noise
+                for row, (key, label, cmap_e, fixed_range, fmt) in enumerate([
+                    ("chi2", "chi2 reduced", "RdYlGn_r", (0.5, 2.0), ".2f"),
+                    ("rmse", "RMSE",         "hot_r",    None,       ".1f"),
+                    ("r2",   "R²",           "RdYlGn",   (0, 1),     ".3f"),
                 ]):
+                    arr_vw = maps[f"{key}_best"]
+                    arr_glob = maps[f"{key}_{global_best}"]
                     for col, (arr, title) in enumerate([
-                        (arr_vw,   f"{label} voxel-wise"),
+                        (arr_vw,   f"{label} voxel-wise (kept model)"),
                         (arr_glob, f"{label} global ({global_best})"),
                     ]):
-                        finite_v = arr[np.isfinite(arr)]
-                        vm_min = vmin_e if vmin_e is not None else (
-                            np.percentile(finite_v, 2)  if len(finite_v) > 0 else None)
-                        vm_max = vmax_e if vmax_e is not None else (
-                            np.percentile(finite_v, 98) if len(finite_v) > 0 else None)
-
-                        im_e = axes[row, col].imshow(
-                            arr, cmap=cmap_e, vmin=vm_min, vmax=vm_max,
-                            origin="upper", interpolation="nearest",
-                        )
-                        axes[row, col].set_title(title)
-                        axes[row, col].axis("off")
-                        fig_e.colorbar(im_e, ax=axes[row, col], fraction=0.046)
-                        _use_array_coords(axes[row, col], arr)
+                        vm_min, vm_max = fixed_range if fixed_range else _percentile_range(arr)
+                        _draw_map(fig_e, axes[row, col], arr, title, cmap_e, vm_min, vm_max)
 
                     ax_dist = axes[row, 2]
+                    both = np.concatenate([arr_vw[np.isfinite(arr_vw)], arr_glob[np.isfinite(arr_glob)]])
+                    hist_range = tuple(np.percentile(both, [0.5, 99.5])) if both.size else None
                     for arr, label_d, color in [
                         (arr_vw,   "voxel-wise", "steelblue"),
                         (arr_glob, "global",     "tomato"),
@@ -1175,8 +1076,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                         finite_v = arr[np.isfinite(arr)]
                         if len(finite_v) > 0:
                             mu = np.mean(finite_v)
-                            fmt = ".3f" if label == "R²" else ".1f"
-                            ax_dist.hist(finite_v, bins=60, density=True,
+                            ax_dist.hist(finite_v, bins=60, range=hist_range, density=True,
                                          alpha=0.5, color=color,
                                          label=f"{label_d} µ={mu:{fmt}}")
                             ax_dist.axvline(mu, color=color, linestyle="--", linewidth=1.5)
@@ -1219,7 +1119,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                         "zaxis_title": "Z (mm)",
                     }
                 else:
-                    x_coords, y_coords, z_coords = x_idx, y_idx, z_idx
+                    x_coords, y_coords, z_coords = x_idx, y_idx, z_idx + 1   # slices counted from 1
                     axis_titles = {
                         "xaxis_title": "X (voxels)", "yaxis_title": "Y (voxels)",
                         "zaxis_title": "Z (slice index)",
@@ -1238,7 +1138,7 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                     caps={"x_show": False, "y_show": False, "z_show": False},
                 ))
                 fig_3d.update_layout(
-                    title=f"3D view — echo 0 | threshold {iso_min:.0f}–{iso_max:.0f}",
+                    title=f"3D view — echo 1 | threshold {iso_min:.0f}–{iso_max:.0f}",
                     scene={**axis_titles, "aspectmode": "data"},
                     margin={"l": 0, "r": 0, "t": 40, "b": 0},
                 )
@@ -1254,36 +1154,14 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                 fig.canvas.draw_idle()
                 plt.pause(0.001)  # force le rendu orange avant l'écriture disque
 
-                out_path = Path("exports") / f"T2_slice_z{z}"
+                out_path = Path("exports") / f"T2_slice_{z + 1}"
 
-                # (cache_key, index -> nom de colonne) pour chaque carte 2D déjà calculée
-                export_names = {
-                    ("mono", z): {
-                        0: "T2_mono", 1: "T2_mono_offset", 2: "T2_mono_cfix",
-                    },
-                    ("bi", z): {
-                        0: "T2c_bi", 1: "T2l_bi", 2: "T2c_bi_offset",
-                        3: "T2l_bi_offset", 4: "T2eff_bi", 5: "T2eff_bi_offset",
-                    },
-                    ("noise", z): {0: "C_mono_offset", 1: "C_bi_offset"},
-                    ("error", z): {0: "R2_voxelwise", 1: "RMSE_voxelwise"},
-                    ("utils", z): {
-                        0: "AIC_best_model_index", 1: "I0_voxelwise", 2: "I0_global",
-                        3: "R2_map", 4: "RMSE_map", 5: "f_bi", 6: "f_bi_offset",
-                        7: "T2_effective",
-                    },
-                }
-
-                # Construit un seul dict {nom_colonne: array 2D} à partir de
-                # tout ce qui est déjà en cache pour cette coupe.
+                # Toutes les cartes de la coupe viennent du même calcul (cache ("fit", z)).
+                # Les colonnes du bi sont vides là où le mono suffit, comme sur la Bi Map.
                 maps_dict = {}
-                for cache_key, names in export_names.items():
-                    if cache_key not in cache:
-                        continue
-                    values = cache[cache_key][:-1]  # dernier élément = t_elapsed
-                    for idx, arr in enumerate(values):
-                        if idx in names and isinstance(arr, np.ndarray) and arr.ndim == 2:
-                            maps_dict[names[idx]] = arr
+                if ("fit", z) in cache:
+                    fit_maps = cache[("fit", z)]["maps"]
+                    maps_dict = {name: fit_maps[key] for key, name in _EXPORT_COLUMNS.items()}
 
                 if maps_dict and capillary_mask is not None and capillary_mask[:, :, z].any():
                     # 1 = voxel flagged as capillary via the Select tool,
@@ -1308,12 +1186,24 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                     maps_dict["y_mm"] = cols * dy
                     maps_dict["z_mm"] = np.full((nx_e, ny_e), z * dz)
 
+                if roi_list:
+                    # The ROIs do not depend on any map: written whatever the slice.
+                    voxels_path, fits_path = export_rois(roi_list, Path("exports") / "T2_ROIs")
+                    print(f"[Export] {len(roi_list)} ROI exportée(s) : {voxels_path} et {fits_path}")
+
                 if not maps_dict:
-                    print(
-                        "[Export] Rien à exporter — calcule d'abord une carte "
-                        "(Mono Map, Bi Map, Noise, Error ou Utils) pour cette coupe."
-                    )
-                    _set_button(button, "#C44E52")
+                    if roi_list:
+                        print(
+                            "[Export] Aucune carte calculée pour cette coupe : seules les ROI "
+                            "sont exportées (Mono Map, Bi Map, Utils, Error ou Noise pour la carte)."
+                        )
+                        _set_button(button, "#7bff23")
+                    else:
+                        print(
+                            "[Export] Rien à exporter — calcule d'abord une carte "
+                            "(Mono Map, Bi Map, Utils, Error ou Noise) pour cette coupe."
+                        )
+                        _set_button(button, "#C44E52")
                 else:
                     # Masque tissulaire (grain) de cette coupe : ne garde que
                     # les voxels non nuls / non bruit de fond.
@@ -1356,9 +1246,6 @@ def display_slice(data, te, mask=None, voxel_dims=None):
                         )
                         _set_button(button, "#7bff23")
 
-                if roi_list:
-                    export_rois(roi_list, Path("exports") / "T2_ROIs")
-
             fig.canvas.draw_idle()
 
         return toggle_mode
@@ -1394,9 +1281,13 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         if event.inaxes is not ax:
             return
 
-        col = int(event.xdata)   # plot x = array column
-        row = int(event.ydata)   # plot y = array row
+        # A voxel is centred on integer plot coordinates and spans +-0.5 around
+        # them (same rule as the hover readout), so round, do not truncate.
+        col = int(round(event.xdata))   # plot x = array column
+        row = int(round(event.ydata))   # plot y = array row
         z = int(slice_slider.val)
+        if not (0 <= row < data.shape[0] and 0 <= col < data.shape[1]):
+            return
         signal = data[row, col, z, :]
 
         # Labelled (x, y) here in the ARRAY convention used everywhere else
@@ -1405,8 +1296,8 @@ def display_slice(data, te, mask=None, voxel_dims=None):
         # voxel as before, just a label that now matches the rest of the UI.
         _fit_and_plot(
             signal,
-            title=f"Voxel (x={row}, y={col}) — slice z={z}",
-            header_lines=[f"Voxel (x={row}, y={col}) | slice z={z}"],
+            title=f"Voxel (x={row}, y={col}) — slice {z + 1}",
+            header_lines=[f"Voxel (x={row}, y={col}) | slice {z + 1}"],
         )
 
     fig.canvas.mpl_connect("button_press_event", onclick)

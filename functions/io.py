@@ -9,14 +9,27 @@ This module handles:
 
 import csv
 import re
-import tkinter as tk
 from pathlib import Path
-from tkinter import Label, Text
-from tkinter.filedialog import askopenfilename
-from tkinter.ttk import Button
 
 import nibabel as nib
 import numpy as np
+
+try:
+    import tkinter as tk
+    from tkinter import Label, Text
+    from tkinter.filedialog import askopenfilename
+    from tkinter.ttk import Button
+except ImportError:          # Python without Tk (some servers): only the file dialogs are lost
+    tk = Label = Text = askopenfilename = Button = None
+
+
+def _new_root():
+    """Create a Tk window, with a clear message if this Python has no Tk."""
+    if tk is None:
+        raise RuntimeError("tkinter is not installed in this Python, so the file dialogs cannot open. "
+                           "Give the file paths on the command line instead.")
+    return tk.Tk()
+
 
 # ── NIfTI ─────────────────────────────────────────────────────────────────────
 
@@ -58,6 +71,43 @@ def load_nifti(filepath):
     return data, img
 
 
+# Factor to convert each spatial unit a NIfTI header can declare into mm.
+_UNIT_TO_MM = {"meter": 1000.0, "mm": 1.0, "micron": 0.001}
+
+
+def voxel_size_mm(img):
+    """Return the voxel size ``(dx, dy, dz)`` in mm, read from the NIfTI header.
+
+    The header declares its spatial unit (``meter``, ``mm`` or ``micron``);
+    the sizes are converted to mm. If the unit is missing (``unknown``), the
+    sizes are taken as mm, as before, and the caller is told so.
+
+    Parameters
+    ----------
+    img : nibabel.Nifti1Image
+        Image returned by :func:`load_nifti`.
+
+    Returns
+    -------
+    voxel_dims : tuple of 3 floats
+        Voxel size in mm.
+    unit : str
+        Spatial unit written in the header (``"unknown"`` if none).
+    unit_known : bool
+        ``False`` when the header gives no usable unit and mm was assumed.
+
+    Examples
+    --------
+    >>> voxel_dims, unit, unit_known = voxel_size_mm(img)   # doctest: +SKIP
+    """
+    unit = img.header.get_xyzt_units()[0]
+    zooms = [float(v) for v in img.header.get_zooms()[:3]]
+    factor = _UNIT_TO_MM.get(unit)
+    if factor is None:
+        return tuple(zooms), unit, False
+    return tuple(v * factor for v in zooms), unit, True
+
+
 def choose_nifti():
     """Open a GUI file-picker dialog to select a NIfTI file.
 
@@ -72,7 +122,7 @@ def choose_nifti():
     Requires a graphical display. On headless servers, use ``load_nifti``
     directly with a hard-coded path.
     """
-    root = tk.Tk()
+    root = _new_root()
     root.withdraw()
     filepath = askopenfilename(
         title="Select NIfTI file",
@@ -93,7 +143,7 @@ def choose_acqp():
         Absolute path to the selected ACQP file.
         Returns an empty string if the dialog is cancelled.
     """
-    root = tk.Tk()
+    root = _new_root()
     root.withdraw()
     filepath = askopenfilename(
         title="Select ACQP file",
@@ -190,7 +240,7 @@ def enter_te(data):
                 # user entry, not a bug to diagnose.
                 print("[TE] Invalid input — please enter numeric values.")
 
-    root = tk.Tk()
+    root = _new_root()
     root.title("Enter echo times")
     root.geometry("280x170")
 
@@ -247,7 +297,7 @@ def handle_acqp(data):
         result["choice"] = value
         root.destroy()
 
-    root = tk.Tk()
+    root = _new_root()
     root.title("Echo time source")
     root.minsize(220, 110)
     root.maxsize(220, 110)
@@ -285,8 +335,9 @@ def export_table(maps_dict, z, filepath, mask=None):
         Mapping from column name to a 2-D array of shape (nx, ny). All
         arrays must share the same shape.
     z : int
-        Slice index, written into a ``slice`` column for traceability
-        (useful once several slices get concatenated into one file).
+        Slice index, counted from 0 like everywhere in the code. It is written as
+        ``z + 1`` (the number shown in the viewer) into a ``slice`` column for
+        traceability (useful once several slices get concatenated into one file).
     filepath : str or os.PathLike
         Destination path, with or without ``.csv`` extension.
     mask : np.ndarray of shape (nx, ny), dtype bool, optional
@@ -304,8 +355,8 @@ def export_table(maps_dict, z, filepath, mask=None):
 
     Examples
     --------
-    >>> maps = {"T2_mono": t2_mono, "T2_mono_offset": t2_mono_off}
-    >>> export_table(maps, z=7, filepath="exports/T2_z7", mask=mask[:, :, 7])
+    >>> maps = {"T2_mono": t2_mono, "T2c_bi": t2c, "T2l_bi": t2l}
+    >>> export_table(maps, z=7, filepath="exports/T2_slice_8", mask=mask[:, :, 7])   # slice 8 of the viewer
     """
     filepath = Path(filepath).with_suffix(".csv")
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -329,7 +380,7 @@ def export_table(maps_dict, z, filepath, mask=None):
                 # Decimal point (pandas / R / Python / English Excel). The column
                 # separator stays ";" : read with sep=";" (pandas) or the
                 # "Delimited, ;" import wizard in Excel.
-                row = [z, x, y] + [f"{arr[x, y]:.6f}" for arr in arrays]
+                row = [z + 1, x, y] + [f"{arr[x, y]:.6f}" for arr in arrays]
                 writer.writerow(row)
                 n_rows += 1
 
@@ -337,20 +388,25 @@ def export_table(maps_dict, z, filepath, mask=None):
     return filepath, n_rows
 
 def export_rois(roi_list, filepath):
-    """Write the "Average + Fit" regions of the session as two CSV files.
+    """Write the "Zone fit" regions of the session as two CSV files.
 
     ``<filepath>_voxels.csv`` : one row per voxel of each ROI (roi;slice;x;y),
-    so the exact region can be found again. ``<filepath>_fits.csv`` : one row
-    per ROI and model (roi;scope;n_voxels;model;best_aic;I0;T2;T2l;f;C), where
-    ``T2`` is the single T2 (mono) or the short T2c (bi). Same conventions as
-    ``export_table`` (decimal point, ``;`` separator, x = row, y = column).
+    so the exact region can be found again (``slice`` counted from 1 like in the
+    viewer; ``x`` and ``y`` from 0). ``<filepath>_fits.csv`` : one row
+    per ROI and model (roi;scope;n_voxels;model;kept;I0;T2;T2c;T2l;f;loglik;aicc;
+    delta_aicc;chi2_red;at_limit). ``T2`` is filled for the mono model, ``T2c``,
+    ``T2l`` and ``f`` for the bi model; ``kept`` is 1 for the model the data
+    justify; ``delta_aicc`` is the evidence for bi (the same on both rows of a
+    ROI); ``at_limit`` is 1 if a T2 ended on a limit of the search range. Same
+    conventions as ``export_table`` (decimal point, ``;`` separator, x = row,
+    y = column).
 
     Parameters
     ----------
     roi_list : list[dict]
-        Entries with keys ``id``, ``scope``, ``coords`` (list of (z, x, y)),
-        ``best_model`` and ``params`` (model name -> dict of fitted values
-        or None).
+        Entries with keys ``id``, ``scope``, ``coords`` (list of (z, x, y), z counted from 0),
+        ``fit`` (output of :func:`functions.model.fit_both` on the whole zone)
+        and ``chi2`` (model name -> reduced chi-square).
     filepath : str or os.PathLike
         Base path (no extension), e.g. ``exports/T2_ROIs``.
 
@@ -371,22 +427,24 @@ def export_rois(roi_list, filepath):
         w.writerow(["roi", "slice", "x", "y"])
         for roi in roi_list:
             for z, x, y in roi["coords"]:
-                w.writerow([roi["id"], z, x, y])
+                w.writerow([roi["id"], z + 1, x, y])
 
     with open(fits_path, "w", newline="") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["roi", "scope", "n_voxels", "model", "best_aic",
-                    "I0", "T2", "T2l", "f", "C"])
+        w.writerow(["roi", "scope", "n_voxels", "model", "kept", "I0", "T2", "T2c", "T2l",
+                    "f", "loglik", "aicc", "delta_aicc", "chi2_red", "at_limit"])
         for roi in roi_list:
-            for model, p in roi["params"].items():
-                if p is None:
+            fit = roi["fit"]
+            for model in ("mono", "bi"):
+                res = fit[model]
+                if res is None:
                     continue
+                p = res["params"]
                 w.writerow([
                     roi["id"], roi["scope"], len(roi["coords"]), model,
-                    int(model == roi["best_model"]),
-                    fmt(p.get("I0")), fmt(p.get("T2", p.get("T2c"))),
-                    fmt(p.get("T2l")), fmt(p.get("f")), fmt(p.get("C")),
+                    int(model == fit["best"]),
+                    fmt(p.get("I0")), fmt(p.get("T2")), fmt(p.get("T2c")), fmt(p.get("T2l")),
+                    fmt(p.get("f")), fmt(res["loglik"]), fmt(res["aicc"]), fmt(fit["delta_aicc"]),
+                    fmt(roi["chi2"].get(model)), int(res["at_bound"]),
                 ])
-
-    print(f"[Export] {len(roi_list)} ROI(s) → {voxels_path} et {fits_path}")
     return voxels_path, fits_path

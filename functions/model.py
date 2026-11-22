@@ -1,376 +1,288 @@
 """
-Exponential decay models for MRI T2 relaxometry.
+T2 decay models and their fit under Rician noise.
 
-This module provides four analytical signal models and the fitting functions
-that wrap ``scipy.optimize.curve_fit``. All models describe the spin-echo
-signal decay as a function of echo time (TE).
+Two models describe the spin-echo signal ``S(t)`` as a function of the echo
+time ``t`` (ms):
 
-Models
-------
-- Mono-exponential : ``S(t) = I0 · exp(-t / T2)``
-- Mono-exponential with offset : ``S(t) = I0 · exp(-t / T2) + C``
-- Bi-exponential : ``S(t) = I0 · [f · exp(-t / T2c) + (1-f) · exp(-t / T2l)]``
-- Bi-exponential with offset : bi model + constant offset C
+- **mono** : ``S(t) = I0 * exp(-t / T2)``
+- **bi**   : ``S(t) = I0 * [f * exp(-t / T2c) + (1 - f) * exp(-t / T2l)]``
+  (``T2c`` = short component, ``T2l`` = long component, ``f`` = share of the
+  short one)
+
+How the fit works
+-----------------
+An MRI magnitude image is never negative, so its noise is not symmetric around
+the true signal: when the true signal is small, the measured value stays above
+zero, at about ``1.25 * sigma`` (the "noise floor"). A plain least-squares fit
+reads that floor as real signal and over-estimates the long T2.
+
+Here the noise level ``sigma`` is measured once in the background of the image
+(:func:`functions.utils.estimate_sigma`), then the fit looks for the parameters
+that make the measured values the **most probable** under the exact law of the
+noise (the Rice law): this is the *maximum likelihood* method. It needs no extra
+"offset" parameter, the noise floor is already part of the model.
+
+Which model to trust
+--------------------
+``bi`` always fits at least as well as ``mono`` since it has more freedom, so a
+better fit is not enough. :func:`fit_both` keeps ``bi`` only if it improves the
+likelihood by more than its two extra parameters cost (AICc criterion).
+
+Several voxels
+--------------
+Giving a 2-D array (voxels x echoes) to :func:`fit_model` fits all the voxels
+together, with the same likelihood: nothing is averaged before the fit, so the
+noise floor is not distorted. The voxels share the **shape** of the decay (T2,
+or T2c, T2l and f) but each keeps its **own amplitude**, because two voxels of
+the same tissue rarely have the same signal level. This is what "Zone fit"
+uses.
 
 Notes
 -----
-All T2 values are in milliseconds. Initial parameter estimates are derived
-from a log-linear regression on the signal to improve convergence speed and
-robustness.
+All T2 values are in milliseconds. The search bounds depend only on the
+acquisition (first and last echo times), never on the voxel being fitted.
 """
 
 import numpy as np
-from scipy.optimize import curve_fit
+from scipy.optimize import minimize
+from scipy.special import i0e, i1e
 
-# ── Analytical models ─────────────────────────────────────────────────────────
+MODELS = ("mono", "bi")
 
-def _mono(t, I0, T2):
+# bi is kept only if AICc(mono) - AICc(bi) is larger than this. 0 would be the plain
+# "lowest AICc wins" rule (about 3 % of pure-mono voxels called bi); 2 brings that
+# false-alarm rate to about 1 %. Measured by ``python validation.py`` (section 4).
+DELTA_AICC = 2.0
+
+# Starting points tried for the bi fit, as (f, short T2, long T2), the T2 being
+# multiples of the mono T2 found first. The best result of the starts is kept.
+_BI_STARTS = ((0.5, 0.4, 2.5), (0.3, 0.25, 1.6), (0.7, 0.6, 4.0))
+
+
+# ── Signal models ─────────────────────────────────────────────────────────────
+
+def signal_mono(t, I0, T2):
+    """Mono-exponential decay."""
     return I0 * np.exp(-t / T2)
 
 
-def _mono_offset(t, I0, T2, C):
-    return I0 * np.exp(-t / T2) + C
-
-
-def _bi(t, I0, f, T2c, T2l):
+def signal_bi(t, I0, f, T2c, T2l):
+    """Bi-exponential decay (``f`` = share of the short component ``T2c``)."""
     return I0 * (f * np.exp(-t / T2c) + (1 - f) * np.exp(-t / T2l))
 
 
-def _bi_offset(t, I0, f, T2c, T2l, C):
-    return I0 * (f * np.exp(-t / T2c) + (1 - f) * np.exp(-t / T2l)) + C
+def t2_limits(te):
+    """Fixed physical search range for every T2, from the acquisition only.
 
-
-# ── Initial parameter estimation ──────────────────────────────────────────────
-
-def _estimate_p0(te, signal):
-    """Estimate initial parameters via log-linear regression.
-
-    Fits ``log(S) = log(I0) - t / T2`` by ordinary least squares on the
-    positive signal values, providing robust starting points for non-linear
-    optimisation.
-
-    Parameters
-    ----------
-    te : array-like of shape (n_te,)
-        Echo times in milliseconds.
-    signal : array-like of shape (n_te,)
-        Observed signal intensities (must contain at least 2 positive values).
-
-    Returns
-    -------
-    I0_est : float
-        Estimated signal amplitude at TE = 0.
-    T2_est : float
-        Estimated T2 relaxation time in milliseconds (clamped to ≥ 1 ms).
+    Below half the first echo time a decay is over before it is measured; above
+    five times the last echo time the signal is nearly flat over the whole
+    acquisition, so T2 cannot be read from it.
     """
-    s = np.array(signal, dtype=float)
-    mask = s > 0
-    if mask.sum() < 2:
-        return float(s[0]) if s[0] > 0 else 1.0, 50.0
-
-    log_s = np.log(s[mask])
-    t_m = np.array(te)[mask]
-    coeffs = np.polyfit(t_m, log_s, 1)
-    T2_est = max(-1.0 / coeffs[0], 1.0)
-    I0_est = np.exp(coeffs[1])
-    return I0_est, T2_est
+    return 0.5 * float(te[0]), 5.0 * float(te[-1])
 
 
-# ── Mono-exponential fit ──────────────────────────────────────────────────────
+# ── Rice law ──────────────────────────────────────────────────────────────────
 
-def fit_mono(te, signal):
-    """Fit a mono-exponential decay model to a T2 signal.
+def rice_mean(nu, sigma):
+    """Mean of a Rician magnitude whose noise-free value is ``nu``.
 
-    Model: ``S(t) = I0 · exp(-t / T2)``
-
-    Parameters
-    ----------
-    te : array-like of shape (n_te,)
-        Echo times in milliseconds.
-    signal : array-like of shape (n_te,)
-        Observed signal intensities.
-
-    Returns
-    -------
-    params : dict or None
-        Fitted parameters ``{"I0": float, "T2": float}``.
-        ``None`` if optimisation failed.
-    fitted : np.ndarray of shape (n_te,) or None
-        Model-predicted signal at the fitted parameters.
-        ``None`` if optimisation failed.
-    covariance : np.ndarray of shape (2, 2) or None
-        Covariance matrix of the fitted parameters.
-        ``None`` if optimisation failed.
-
-    Examples
-    --------
-    >>> params, fitted, cov = fit_mono(te, signal)
-    >>> if params is not None:
-    ...     print(f"T2 = {params['T2']:.1f} ms")
+    Equals ``sigma * sqrt(pi/2)`` (the noise floor) when ``nu = 0`` and tends to
+    ``nu`` when ``nu`` is much larger than ``sigma``.
     """
-    te = np.asarray(te, dtype=float)
-    sig = np.asarray(signal, dtype=float)
-
-    I0_est, T2_est = _estimate_p0(te, sig)
-    p0 = [I0_est, T2_est]
-    bounds = ([0, 0.1], [np.inf, 5000.0])
-
-    try:
-        popt, pcov = curve_fit(
-            _mono, te, sig,
-            p0=p0, bounds=bounds,
-            method="trf", maxfev=10000,
-        )
-        return {"I0": popt[0], "T2": popt[1]}, _mono(te, *popt), pcov
-    except Exception:
-        # Deliberately broad: scipy's curve_fit can raise several
-        # different exception types on failure (RuntimeError on no
-        # convergence, ValueError on invalid p0/bounds, numpy's
-        # LinAlgError from the internal SVD, ...). Every caller in this
-        # codebase treats "fit failed, for any reason" identically —
-        # a None result, never a crash — so narrowing this would only
-        # reintroduce crashes on legitimate edge cases without
-        # changing behaviour for genuine bugs (those still show up as
-        # every voxel failing, not a silent single miss).
-        return None, None, None
+    b = np.asarray(nu, dtype=float) ** 2 / (4.0 * sigma**2)
+    return sigma * np.sqrt(np.pi / 2.0) * ((1 + 2 * b) * i0e(b) + 2 * b * i1e(b))
 
 
-# ── Mono-exponential with offset ──────────────────────────────────────────────
+def rice_var(nu, sigma):
+    """Variance of a Rician magnitude whose noise-free value is ``nu``."""
+    nu = np.asarray(nu, dtype=float)
+    return np.maximum(2.0 * sigma**2 + nu**2 - rice_mean(nu, sigma) ** 2, 1e-12 * sigma**2)
 
-def fit_mono_offset(te, signal):
-    """Fit a mono-exponential decay model with a constant offset.
 
-    Model: ``S(t) = I0 · exp(-t / T2) + C``
+def rice_loglik(M, nu, sigma):
+    """Log-likelihood of measured magnitudes ``M`` for noise-free values ``nu``.
 
-    The offset C accounts for Rician noise floor or residual signal from
-    long-T2 components not captured by a single exponential.
+    Terms that do not depend on ``nu`` are left out: they are identical for every
+    model fitted on the same data, so they cancel in any model comparison.
+    """
+    x = M * nu / sigma**2
+    return float(np.sum(-((M - nu) ** 2) / (2 * sigma**2) + np.log(i0e(x))))
+
+
+# ── Maximum-likelihood fit ────────────────────────────────────────────────────
+
+def _shape(theta, t, model):
+    """Unit-amplitude decay ``s(t)`` and its derivatives for the internal shape parameters.
+
+    Internal shape parameters: ``log(T2)`` for ``mono``; the share ``f`` then
+    ``log(T2)`` of each component for ``bi`` (the log keeps every T2 positive and
+    treats 10 -> 20 ms like 100 -> 200 ms). Returns ``s`` of shape ``(n_te,)`` and
+    ``ds`` of shape ``(n_te, n_shape_params)``.
+    """
+    if model == "mono":
+        e = np.exp(-t / np.exp(theta[0]))
+        return e, (e * t / np.exp(theta[0]))[:, None]
+    f, lc, ll = theta
+    ec, el = np.exp(-t / np.exp(lc)), np.exp(-t / np.exp(ll))
+    ds = np.stack([ec - el, f * ec * t / np.exp(lc), (1 - f) * el * t / np.exp(ll)], axis=1)
+    return f * ec + (1 - f) * el, ds
+
+
+def _neg_loglik(theta, t, y, sigma, model):
+    """Negative log-likelihood of all the voxels in ``y`` (n_voxels x n_te) and its gradient.
+
+    ``theta`` = one amplitude per voxel, then the shared shape parameters.
+    """
+    m = y.shape[0]
+    amp = theta[:m]
+    s, ds = _shape(theta[m:], t, model)
+    nu = amp[:, None] * s[None, :]
+    x = y * nu / sigma**2
+    e0, e1 = i0e(x), i1e(x)
+    nll = np.sum((y - nu) ** 2 / (2 * sigma**2) - np.log(e0))
+    # d(nll)/d(nu) = (nu - y * I1(x)/I0(x)) / sigma^2 for every measurement
+    g_nu = (nu - y * e1 / e0) / sigma**2
+    return float(nll), np.concatenate([g_nu @ s, (amp @ g_nu) @ ds])
+
+
+def _start_values(te, mean_curve, sigma):
+    """Amplitude and T2 from a straight-line fit of log(signal), on the echoes
+    clearly above the noise floor (at least the first three)."""
+    n_ok = min(max(3, int(np.sum(mean_curve > 2.0 * sigma))), len(te))
+    slope, intercept = np.polyfit(te[:n_ok], np.log(np.maximum(mean_curve[:n_ok], 1e-12)), 1)
+    return float(np.exp(intercept)), (-1.0 / slope if slope < 0 else np.inf)
+
+
+def fit_model(model, te, signal, sigma):
+    """Fit one model by maximum likelihood under Rician noise.
 
     Parameters
     ----------
+    model : {"mono", "bi"}
     te : array-like of shape (n_te,)
-        Echo times in milliseconds.
-    signal : array-like of shape (n_te,)
-        Observed signal intensities.
+        Echo times in ms.
+    signal : array-like of shape (n_te,) or (n_voxels, n_te)
+        Measured magnitudes. A 2-D array is treated as several voxels of one
+        homogeneous zone: they share the shape of the decay but each has its own
+        amplitude (see the module docstring).
+    sigma : float
+        Noise level of the acquisition, in the units of ``signal``.
 
     Returns
     -------
-    params : dict or None
-        Fitted parameters ``{"I0": float, "T2": float, "C": float}``.
-        ``None`` if optimisation failed.
-    fitted : np.ndarray of shape (n_te,) or None
-        Model-predicted signal. ``None`` if optimisation failed.
-    covariance : np.ndarray of shape (3, 3) or None
-        Covariance matrix. ``None`` if optimisation failed.
-
-    Examples
-    --------
-    >>> params, fitted, cov = fit_mono_offset(te, signal)
-    >>> if params is not None:
-    ...     print(f"T2 = {params['T2']:.1f} ms, offset C = {params['C']:.1f}")
+    result : dict or None
+        ``params`` (``I0``, ``T2`` for mono; ``I0``, ``f``, ``T2c``, ``T2l`` for
+        bi; for a zone ``I0`` is the mean amplitude of its voxels), ``fitted``
+        (noise-free signal at ``te``; for a zone, of the average voxel),
+        ``expected`` (what the model predicts you will *measure*: the fitted
+        signal plus the noise floor), ``amp`` (amplitude of each voxel) and
+        ``shape`` (the unit decay), ``loglik``, ``aicc``, ``n_obs``, ``n_params``
+        (all the free parameters, the amplitudes included) and ``at_bound`` (a T2
+        ended on a limit of the search range, so its value is not reliable).
+        ``None`` if the data cannot be fitted.
     """
     te = np.asarray(te, dtype=float)
-    sig = np.asarray(signal, dtype=float)
+    y = np.atleast_2d(np.asarray(signal, dtype=float))
+    m = y.shape[0]
+    mean_curve = y.mean(axis=0)
+    scale = float(mean_curve.max())
+    if not (np.all(np.isfinite(y)) and scale > 0 and sigma > 0):
+        return None
 
-    I0_est, T2_est = _estimate_p0(te, sig)
-    C_est = float(np.percentile(sig, 5))
-    p0 = [I0_est, T2_est, C_est]
-    bounds = ([0, 0.1, 0], [np.inf, 5000.0, np.inf])
+    yn, sn = y / scale, sigma / scale
+    t_lo, t_hi = t2_limits(te)
+    lo, hi = np.log(t_lo), np.log(t_hi)
+    i0_start, t2_start = _start_values(te, mean_curve / scale, sn)
+    t2_start = float(np.clip(t2_start, t_lo * 1.5, t_hi / 1.5))
+    # each voxel starts at the amplitude of the mean curve, scaled by its own first echoes
+    gain = np.clip(y[:, :3].mean(axis=1) / max(mean_curve[:3].mean(), 1e-12), 0.05, 20.0)
+    amp0 = i0_start * gain
 
-    try:
-        popt, pcov = curve_fit(
-            _mono_offset, te, sig,
-            p0=p0, bounds=bounds,
-            method="trf", maxfev=10000,
-        )
-        params = {"I0": popt[0], "T2": popt[1], "C": popt[2]}
-        return params, _mono_offset(te, *popt), pcov
-    except Exception:
-        # Deliberately broad: scipy's curve_fit can raise several
-        # different exception types on failure (RuntimeError on no
-        # convergence, ValueError on invalid p0/bounds, numpy's
-        # LinAlgError from the internal SVD, ...). Every caller in this
-        # codebase treats "fit failed, for any reason" identically —
-        # a None result, never a crash — so narrowing this would only
-        # reintroduce crashes on legitimate edge cases without
-        # changing behaviour for genuine bugs (those still show up as
-        # every voxel failing, not a silent single miss).
-        return None, None, None
+    if model == "mono":
+        shape_starts = [[np.log(t2_start)]]
+        shape_bounds = [(lo, hi)]
+    else:
+        shape_starts = [[f0, np.log(t2_start * a), np.log(min(t2_start * b, t_hi / 1.5))] for f0, a, b in _BI_STARTS]
+        shape_bounds = [(0, 1), (lo, hi), (lo, hi)]
+    bounds = [(0, 50)] * m + shape_bounds
+    lower, upper = np.array([b[0] for b in bounds]), np.array([b[1] for b in bounds])
 
+    best = None
+    for sh in shape_starts:
+        x0 = np.clip(np.concatenate([amp0, sh]), lower, upper)
+        res = minimize(_neg_loglik, x0, args=(te, yn, sn, model), jac=True, method="L-BFGS-B",
+                       bounds=bounds, options={"maxiter": 500, "ftol": 1e-12, "gtol": 1e-8})
+        if np.isfinite(res.fun) and (best is None or res.fun < best.fun):
+            best = res
+    if best is None:
+        return None
 
-# ── Bi-exponential fit ────────────────────────────────────────────────────────
+    amp, th = best.x[:m] * scale, best.x[m:]
+    if model == "mono":
+        params = {"I0": float(amp.mean()), "T2": float(np.exp(th[0]))}
+        t2_checked = [params["T2"]]
+        shape = signal_mono(te, 1.0, params["T2"])
+    else:
+        f, t2c, t2l = float(th[0]), float(np.exp(th[1])), float(np.exp(th[2]))
+        if t2c > t2l:                       # the two labels are interchangeable:
+            f, t2c, t2l = 1 - f, t2l, t2c   # always call the short one T2c
+        params = {"I0": float(amp.mean()), "f": f, "T2c": t2c, "T2l": t2l}
+        shape = signal_bi(te, 1.0, f, t2c, t2l)
+        # a component that carries (almost) no signal has a meaningless T2
+        t2_checked = [t for t, share in ((t2c, f), (t2l, 1 - f)) if share > 0.01]
 
-def fit_bi(te, signal):
-    """Fit a bi-exponential decay model to a T2 signal.
-
-    Model: ``S(t) = I0 · [f · exp(-t / T2c) + (1-f) · exp(-t / T2l)]``
-
-    where T2c is the short (constrained) component and T2l is the long
-    (free) component. Initial parameters are anchored on the mono-exponential
-    T2 estimate to improve convergence.
-
-    A post-fit consistency check discards solutions whose effective T2
-    (``f · T2c + (1-f) · T2l``) deviates by more than 200 % from the
-    mono-exponential estimate, which typically indicates a degenerate fit.
-
-    Parameters
-    ----------
-    te : array-like of shape (n_te,)
-        Echo times in milliseconds.
-    signal : array-like of shape (n_te,)
-        Observed signal intensities.
-
-    Returns
-    -------
-    params : dict or None
-        Fitted parameters ``{"I0": float, "f": float, "T2c": float, "T2l": float}``.
-        ``None`` if optimisation failed or consistency check failed.
-    fitted : np.ndarray of shape (n_te,) or None
-        Model-predicted signal. ``None`` on failure.
-    covariance : np.ndarray of shape (4, 4) or None
-        Covariance matrix. ``None`` on failure.
-
-    Notes
-    -----
-    ``f`` is the fraction of the short-T2 (constrained water) component,
-    bounded to [0.05, 0.95] to avoid degenerate single-component solutions.
-
-    Examples
-    --------
-    >>> params, fitted, cov = fit_bi(te, signal)
-    >>> if params is not None:
-    ...     print(f"T2c = {params['T2c']:.1f} ms, T2l = {params['T2l']:.1f} ms")
-    """
-    te = np.asarray(te, dtype=float)
-    sig = np.asarray(signal, dtype=float)
-
-    I0_est, T2_mono = _estimate_p0(te, sig)
-
-    T2c_est = max(T2_mono / 4.0, te[0])
-    T2l_est = min(T2_mono * 2.5, te[-1] * 0.8)
-    T2l_est = max(T2l_est, T2c_est * 2.5)
-    if T2l_est <= T2c_est:
-        T2l_est = T2c_est * 3.0
-
-    p0 = [I0_est, 0.5, T2c_est, T2l_est]
-
-    T2l_max = min(T2c_est * 10.0, T2_mono * 5.0, te[-1] * 3.0)
-    T2c_max = min(T2l_est * 0.45, T2_mono * 1.5)
-    bounds = (
-        [0,      0.05, te[0] * 0.5, T2c_est * 2.0],
-        [np.inf, 0.95, T2c_max,     T2l_max       ],
-    )
-
-    if bounds[0][2] >= bounds[1][2] or bounds[0][3] >= bounds[1][3]:
-        return None, None, None
-
-    try:
-        popt, pcov = curve_fit(
-            _bi, te, sig,
-            p0=p0, bounds=bounds,
-            method="trf", maxfev=20000,
-        )
-        f_val, T2c_val, T2l_val = popt[1], popt[2], popt[3]
-        T2_eff = f_val * T2c_val + (1 - f_val) * T2l_val
-        if abs(T2_eff - T2_mono) / (T2_mono + 1e-10) > 2.0:
-            return None, None, None
-
-        params = {"I0": popt[0], "f": popt[1], "T2c": popt[2], "T2l": popt[3]}
-        return params, _bi(te, *popt), pcov
-    except Exception:
-        # Deliberately broad: scipy's curve_fit can raise several
-        # different exception types on failure (RuntimeError on no
-        # convergence, ValueError on invalid p0/bounds, numpy's
-        # LinAlgError from the internal SVD, ...). Every caller in this
-        # codebase treats "fit failed, for any reason" identically —
-        # a None result, never a crash — so narrowing this would only
-        # reintroduce crashes on legitimate edge cases without
-        # changing behaviour for genuine bugs (those still show up as
-        # every voxel failing, not a silent single miss).
-        return None, None, None
+    nu = amp[:, None] * shape[None, :]
+    n_obs, k = y.size, m + len(th)
+    loglik = rice_loglik(y, nu, sigma)
+    penalty = 2 * k + (2 * k * (k + 1) / (n_obs - k - 1) if n_obs - k - 1 > 0 else np.inf)
+    return {
+        "model": model, "params": params, "fitted": nu.mean(axis=0),
+        "expected": rice_mean(nu, sigma).mean(axis=0), "amp": amp, "shape": shape,
+        "loglik": loglik, "aicc": -2.0 * loglik + penalty, "n_obs": n_obs, "n_params": k,
+        "at_bound": any(t <= t_lo * 1.001 or t >= t_hi * 0.999 for t in t2_checked),
+    }
 
 
-# ── Bi-exponential with offset ────────────────────────────────────────────────
-
-def fit_bi_offset(te, signal):
-    """Fit a bi-exponential decay model with a constant offset.
-
-    Model: ``S(t) = I0 · [f · exp(-t/T2c) + (1-f) · exp(-t/T2l)] + C``
-
-    Uses the same anchoring strategy as :func:`fit_bi` with an additional
-    offset parameter C estimated from the 5th percentile of the signal.
-
-    Parameters
-    ----------
-    te : array-like of shape (n_te,)
-        Echo times in milliseconds.
-    signal : array-like of shape (n_te,)
-        Observed signal intensities.
+def fit_both(te, signal, sigma, delta=DELTA_AICC):
+    """Fit mono and bi, then keep the one the data justify.
 
     Returns
     -------
-    params : dict or None
-        Fitted parameters
-        ``{"I0": float, "f": float, "T2c": float, "T2l": float, "C": float}``.
-        ``None`` if optimisation failed or consistency check failed.
-    fitted : np.ndarray of shape (n_te,) or None
-        Model-predicted signal. ``None`` on failure.
-    covariance : np.ndarray of shape (5, 5) or None
-        Covariance matrix. ``None`` on failure.
-
-    Examples
-    --------
-    >>> params, fitted, cov = fit_bi_offset(te, signal)
-    >>> if params is not None:
-    ...     print(f"f = {params['f']:.2f}, C = {params['C']:.1f}")
+    out : dict
+        ``mono`` and ``bi`` (results of :func:`fit_model`, or ``None``), ``best``
+        (``"mono"`` or ``"bi"``) and ``delta_aicc`` (``AICc(mono) - AICc(bi)``;
+        positive = the data favour bi). ``bi`` wins only if ``delta_aicc`` is
+        larger than ``delta``.
     """
-    te = np.asarray(te, dtype=float)
-    sig = np.asarray(signal, dtype=float)
+    mono = fit_model("mono", te, signal, sigma)
+    bi = fit_model("bi", te, signal, sigma)
+    d_aicc = mono["aicc"] - bi["aicc"] if (mono and bi) else np.nan
+    best = "bi" if (bi is not None and (mono is None or d_aicc > delta)) else "mono"
+    return {"mono": mono, "bi": bi, "best": best, "delta_aicc": d_aicc}
 
-    I0_est, T2_mono = _estimate_p0(te, sig)
 
-    T2c_est = max(T2_mono / 4.0, te[0])
-    T2l_est = min(T2_mono * 2.5, te[-1] * 0.8)
-    T2l_est = max(T2l_est, T2c_est * 2.5)
-    if T2l_est <= T2c_est:
-        T2l_est = T2c_est * 3.0
+def standardized_residuals(result, signal, sigma):
+    """Measured minus expected, divided by the spread the Rice law predicts there.
 
-    C_est = float(np.percentile(sig, 5))
-    p0 = [I0_est, 0.5, T2c_est, T2l_est, C_est]
+    Same shape as ``signal``. If the model is right they scatter around 0 with a
+    spread of 1, whatever the echo (near the noise floor the spread is smaller
+    than ``sigma`` and the Rice law accounts for it). For a zone, each voxel is
+    compared with the decay it was fitted with (its own amplitude).
+    """
+    y = np.atleast_2d(np.asarray(signal, dtype=float))
+    nu = result["amp"][:, None] * result["shape"][None, :]
+    resid = (y - rice_mean(nu, sigma)) / np.sqrt(rice_var(nu, sigma))
+    return resid.reshape(np.shape(signal))
 
-    T2l_max = min(T2c_est * 10.0, T2_mono * 5.0, te[-1] * 3.0)
-    T2c_max = min(T2l_est * 0.45, T2_mono * 1.5)
-    bounds = (
-        [0,      0.05, te[0] * 0.5, T2c_est * 2.0, 0     ],
-        [np.inf, 0.95, T2c_max,     T2l_max,        np.inf],
-    )
 
-    if bounds[0][2] >= bounds[1][2] or bounds[0][3] >= bounds[1][3]:
-        return None, None, None
+def fit_quality(result, signal, sigma):
+    """Reduced chi-square of a fit, using the known noise level.
 
-    try:
-        popt, pcov = curve_fit(
-            _bi_offset, te, sig,
-            p0=p0, bounds=bounds,
-            method="trf", maxfev=20000,
-        )
-        f_val, T2c_val, T2l_val = popt[1], popt[2], popt[3]
-        T2_eff = f_val * T2c_val + (1 - f_val) * T2l_val
-        if abs(T2_eff - T2_mono) / (T2_mono + 1e-10) > 2.0:
-            return None, None, None
-
-        params = {
-            "I0": popt[0], "f": popt[1],
-            "T2c": popt[2], "T2l": popt[3], "C": popt[4],
-        }
-        return params, _bi_offset(te, *popt), pcov
-    except Exception:
-        # Deliberately broad: scipy's curve_fit can raise several
-        # different exception types on failure (RuntimeError on no
-        # convergence, ValueError on invalid p0/bounds, numpy's
-        # LinAlgError from the internal SVD, ...). Every caller in this
-        # codebase treats "fit failed, for any reason" identically —
-        # a None result, never a crash — so narrowing this would only
-        # reintroduce crashes on legitimate edge cases without
-        # changing behaviour for genuine bugs (those still show up as
-        # every voxel failing, not a silent single miss).
-        return None, None, None
+    Sum of the squared :func:`standardized_residuals`, divided by the number of
+    measurements minus the number of free parameters. If the model explains the
+    data down to the noise, the result is close to 1; much larger than 1 means
+    something is missing from the model (or the zone is not homogeneous); much
+    smaller than 1 means a ``sigma`` that is too high.
+    """
+    resid = standardized_residuals(result, signal, sigma)
+    return float(np.sum(resid**2) / (resid.size - result["n_params"]))

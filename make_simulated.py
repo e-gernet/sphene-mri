@@ -152,11 +152,23 @@ def _write_expected_png(path, name, snr, labels, t2c, t2l, frac, centres):
     plt.close(fig)
 
 
-def build(name, disks, snr, te, sigma, seed, out_dir):
+def make_volume(disks, snr, te, sigma, seed):
+    """Simulated volume and its truth, in memory.
+
+    Returns
+    -------
+    data : np.ndarray of shape (NX, NY, NZ, n_te)
+        Magnitude volume with Rician noise.
+    truth : dict
+        ``t2c``, ``t2l``, ``frac`` (NX, NY maps, NaN outside the disks), ``tissue``
+        (bool map), ``centres`` (list of (x, y)), ``labels`` and ``disk`` (int map,
+        index of the disk of each voxel, -1 outside).
+    """
     rng = np.random.default_rng(seed)
     t2c = np.full((NX, NY), np.nan)
     t2l = np.full((NX, NY), np.nan)
     frac = np.full((NX, NY), np.nan)
+    disk_id = np.full((NX, NY), -1)
     tissue = np.zeros((NX, NY), dtype=bool)
     xs, ys = np.mgrid[0:NX, 0:NY]
     labels, centres = [], []
@@ -167,6 +179,7 @@ def build(name, disks, snr, te, sigma, seed, out_dir):
         disk = (xs - centre[0]) ** 2 + (ys - centre[1]) ** 2 <= RADIUS ** 2
         a, b, g = builder(rng, xs[disk], ys[disk], centre, RADIUS)
         t2c[disk], t2l[disk], frac[disk] = a, b, g
+        disk_id[disk] = k
         tissue |= disk
         labels.append(label)
         centres.append(centre)
@@ -179,13 +192,21 @@ def build(name, disks, snr, te, sigma, seed, out_dir):
         amp[tissue, z, :] = i0 * decay
     # Bruit de Rice : module d'un signal complexe avec bruit gaussien sur chaque canal
     data = np.hypot(amp + rng.normal(0, sigma, amp.shape), rng.normal(0, sigma, amp.shape))
+    truth = {"t2c": t2c, "t2l": t2l, "frac": frac, "tissue": tissue, "centres": centres,
+             "labels": labels, "disk": disk_id}
+    return data, truth
 
+
+def build(name, disks, snr, te, sigma, seed, out_dir):
+    """Simulate one data set and write its .nii, .acqp and .png into ``out_dir``."""
+    data, truth = make_volume(disks, snr, te, sigma, seed)
     img = nib.Nifti1Image(data.astype(np.float32), np.diag([*VOXEL_MM, 1.0]))
     img.header.set_zooms((*VOXEL_MM, 1.0))
     out_dir.mkdir(parents=True, exist_ok=True)
     nib.save(img, out_dir / f"{name}.nii")
     _write_acqp(out_dir / f"{name}.acqp", te)
-    _write_expected_png(out_dir / f"{name}.png", name, snr, labels, t2c, t2l, frac, centres)
+    _write_expected_png(out_dir / f"{name}.png", name, snr, truth["labels"], truth["t2c"],
+                        truth["t2l"], truth["frac"], truth["centres"])
 
 
 def main():
