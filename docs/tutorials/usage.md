@@ -147,7 +147,7 @@ calculs et la même présentation que ceux de `quickstats.py` (voir la section 8
 | Action | Ce que la console écrit |
 |--------|-------------------------|
 | **Mono Map** | une ligne : le T2 mono de la coupe affichée |
-| **Bi Map** | une ligne par carte (T2c, T2l, f, T2 effectif), calculée **seulement sur les voxels où le bi est retenu** |
+| **Bi Map** | une ligne par carte (T2c, T2l, f, T2 effectif), calculée **seulement sur les voxels où le bi est retenu** ; si certains de ces voxels ont T2c ou T2l sur une limite de la plage de recherche (valeur peu fiable), la console en donne le nombre |
 | **Show signal** | le signal moyen au premier écho, au dernier écho et le plancher de bruit, puis une ligne avec le T2 mono de chaque voxel de la zone |
 | **Zone fit** | le tableau de l'ajustement d'ensemble (I0, T2, f, AICc, χ² réduit), puis la même ligne de T2 mono voxel par voxel |
 
