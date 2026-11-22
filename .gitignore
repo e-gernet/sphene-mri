@@ -10,6 +10,7 @@ data/*
 !data/test/
 !data/test/**
 simulated/
+validation_report/
 
 # Python - fichiers generes automatiquement
 __pycache__/
