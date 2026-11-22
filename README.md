@@ -119,6 +119,17 @@ pixi run validate           # version complète (environ 8 minutes), à citer da
 pixi run simulate           # jeux simulés .nii + .acqp avec vérité connue
 ```
 
+Statistiques du T2 (nombre de voxels, moyenne, écart-type, médiane, minimum, maximum) sans ouvrir la
+fenêtre, pour une image ou tout un dossier :
+
+```bash
+pixi run stats scan.nii                                      # coupe centrale
+pixi run stats dossier/ --all-slices --exclude-capillary     # un dossier, toutes les coupes, sans le capillaire
+pixi run stats dossier/ --all-slices --csv resultats.csv     # et un fichier CSV
+```
+
+Toutes les options sont décrites dans le tutoriel d'utilisation, section « Statistiques rapides en console ».
+
 ## Documentation
 
 La documentation complète (guide d'installation, tutoriel d'utilisation,
